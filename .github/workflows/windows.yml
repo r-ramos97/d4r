@@ -1,0 +1,86 @@
+# d4r for native Windows (docs/windows.md): ZLUDA with patches/zluda built on a Windows runner, the ZLUDA device
+# helper bitcode and the native network kernels built with ROCm on Linux, the d4r DLLs built with MinGW-w64, and a
+# package for a game folder. The package holds no NVIDIA files and no OptiScaler.
+name: Windows
+
+on:
+  push:
+    branches: [windows-native]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZLUDA_COMMIT: ee2f25a180099fa42f36b2346732e1f2470a03ad
+  ROCM_VERSION: 7.2.4
+
+jobs:
+  rocm:
+    name: ZLUDA helper bitcode and native kernels (ROCm)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ROCm ${{ env.ROCM_VERSION }}
+        run: |
+          sudo mkdir -p --mode=0755 /etc/apt/keyrings
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rocm-llvm rocm-device-libs hip-dev hipcc
+      - name: ZLUDA source with patches/zluda
+        run: scripts/fetch_zluda_source.sh zluda
+      - name: Device helper bitcode (ptx/lib/*.bc)
+        run: ZLUDA_SOURCE_ROOT="$PWD/zluda" ROCM_ROOT=/opt/rocm scripts/build_zluda_ptx_helpers.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zluda-ptx-helpers
+          path: zluda/ptx/lib/*.bc
+          if-no-files-found: error
+      - name: Native network kernels (every target, fast and accuracy)
+        run: D4R_ROCM_DIR=/opt/rocm scripts/build_network_kernels.sh out/kernels
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-kernels
+          path: out/kernels
+          if-no-files-found: error
+
+  zluda:
+    name: ZLUDA for Windows
+    needs: rocm
+    runs-on: windows-2022
+    env:
+      CARGO_TERM_COLOR: always
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Keep line endings (the patches are LF)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: ZLUDA source with patches/zluda
+        shell: bash
+        run: ZLUDA_SUBMODULES=1 scripts/fetch_zluda_source.sh zluda
+      - uses: actions/download-artifact@v4
+        with:
+          name: zluda-ptx-helpers
+          path: zluda/ptx/lib
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build ZLUDA's nvcuda.dll
+        working-directory: zluda
+        run: cargo build --release -p zluda
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp zluda/target/release/nvcuda.dll out/zluda_nvcuda.dll
+          cp zluda/LICENSE-APACHE out/ZLUDA-LICENSE-APACHE.txt
+          cp zluda/LICENSE-MIT out/ZLUDA-LICENSE-MIT.txt
+          cp zluda/ext/llvm-project/llvm/LICENSE.TXT out/LLVM-LICENSE.txt
+          git -C zluda rev-parse HEAD > out/ZLUDA_COMMIT.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zluda-windows
+          path: out
+          if-no-files-found: error

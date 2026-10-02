@@ -1,5 +1,6 @@
-# CPU-only checks: configuration and install-check tests, shell scripts, and the two Windows-side
-# components (the NGX shim and the Wine CUDA bridge). Native kernels need ROCm and are not built here.
+# CPU-only checks: configuration and install-check tests, shell scripts, the two Windows-side components (the NGX
+# shim and the Wine CUDA bridge) and the native Windows bridge, whose tests also run on a Windows runner. Native
+# kernels need ROCm and are built by windows.yml.
 name: CI
 
 on:
@@ -26,11 +27,11 @@ jobs:
         run: python3 -m compileall -q kernels packaging scripts tests tools
 
   windows-components:
-    name: Build the NGX shim and the Wine CUDA bridge
+    name: Build the NGX shim and the CUDA bridges
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install MinGW-w64, clang-cl, Vulkan headers and Wine's winegcc
+      - name: Install MinGW-w64, clang-cl, Vulkan headers and Wine
         run: |
           sudo apt-get update
           sudo apt-get install -y g++-mingw-w64-x86-64-posix clang-tools-18 libvulkan-dev wine64-tools
@@ -41,3 +42,35 @@ jobs:
           MINGW_CXX: x86_64-w64-mingw32-g++-posix
       - name: Wine CUDA bridge (build/wine-nvcuda)
         run: bash scripts/build_wine_nvcuda_bridge.sh
+      - name: Native Windows CUDA bridge (build/windows/nvcuda.dll)
+        run: bash scripts/build_windows_nvcuda.sh
+      - name: Native Windows tests under Wine
+        run: python3 -m unittest tests.test_windows_native -v
+        env:
+          CLANG_CL: /usr/lib/llvm-18/bin/clang-cl
+          MINGW_CXX: x86_64-w64-mingw32-g++-posix
+      - name: Test programs for the Windows runner
+        run: python3 tests/test_windows_native.py --build build/windows-tests
+        env:
+          CLANG_CL: /usr/lib/llvm-18/bin/clang-cl
+          MINGW_CXX: x86_64-w64-mingw32-g++-posix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-tests
+          path: build/windows-tests
+          if-no-files-found: error
+
+  windows-native-tests:
+    name: Native Windows tests on Windows
+    needs: windows-components
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-tests
+          path: windows-tests
+      - name: Bridge and shim against the mock ZLUDA, HIP and NGX core
+        run: python -m unittest tests.test_windows_native -v
+        env:
+          D4R_TEST_PREBUILT: ${{ github.workspace }}\windows-tests

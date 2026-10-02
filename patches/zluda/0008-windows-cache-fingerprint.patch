@@ -1,0 +1,38 @@
+From: d4r
+Subject: [PATCH] Windows: fingerprint the loaded ZLUDA DLL in the module cache key
+
+On Linux the module cache key includes libcuda.so's size and modification time, so a rebuilt ZLUDA never
+reuses modules compiled by an earlier build with the same git revision (patch 0002). The Windows build
+returned no fingerprint and keyed the cache on the git revision alone: after rebuilding ZLUDA with a
+different d4r patch set, the cache in %LOCALAPPDATA%\zluda kept serving the old compiles. Use the size and
+modification time of the loaded nvcuda.dll there too.
+---
+diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
+index 9f72f2f..5d7e734 100644
+--- a/zluda/src/impl/module.rs
++++ b/zluda/src/impl/module.rs
+@@ -467,9 +467,23 @@ fn loaded_library_fingerprint() -> Option<String> {
+     ))
+ }
+ 
++// d4r: as on Linux, the cache key includes this DLL's size and modification time, so a rebuilt ZLUDA
++// (another patch set at the same git revision) never reuses modules an earlier build compiled.
+ #[cfg(windows)]
+ fn loaded_library_fingerprint() -> Option<String> {
+-    None
++    let path = zluda_windows::get_module_path_for_function(zluda_build_version as usize)?;
++    let metadata = fs::metadata(path).ok()?;
++    let modified = metadata
++        .modified()
++        .ok()?
++        .duration_since(std::time::UNIX_EPOCH)
++        .ok()?;
++    Some(format!(
++        "{:x}.{:x}.{:x}",
++        metadata.len(),
++        modified.as_secs(),
++        modified.subsec_nanos()
++    ))
+ }
+ 
+ fn get_cache_key<'a, 'b>(
