@@ -51,6 +51,13 @@ d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and
 
 Native network kernels are built for all listed gfx11/gfx12 targets. Texture kernels are compiled for each target by `d4r_emit` when supplied to the package script; RDNA4 also has a `-fp8` variant. The bridge selects the KFD GPU with the most SIMDs, avoiding an integrated GPU when a discrete GPU is present; `D4R_GPU_ARCH` overrides that choice. Missing native kernels fall back to ZLUDA and can be much slower. Earlier translated K layers produced invalid values; preserving FP16 denormal handling fixes that failure in recorded captures, but RTX image-quality parity remains unverified. Preset E does not use the native network kernels.
 
+## Windows (preview)
+
+A native Windows build is in progress on the `windows-native` branch: the same shim, the nvcuda bridge built
+as a Windows DLL, ZLUDA on AMD's HIP SDK and an NVAPI that reports an Ada GPU, without Linux or Proton. It is
+built and tested in CI against mock libraries but has not run on a real GPU yet, and each frame shows a DLSS
+result one frame old. See [docs/windows.md](docs/windows.md).
+
 ## How it works
 
 ```
