@@ -25,6 +25,16 @@ jobs:
           shellcheck -S error scripts/*.sh kernels/build.sh kernels/tex/build_tex.sh packaging/d4r-check.sh
       - name: Python syntax
         run: python3 -m compileall -q kernels packaging scripts tests tools
+      - name: PowerShell syntax (the Windows package's scripts)
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem packaging/windows/*.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "$($file.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
 
   windows-components:
     name: Build the NGX shim and the CUDA bridges

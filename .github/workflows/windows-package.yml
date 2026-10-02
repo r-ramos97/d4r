@@ -127,6 +127,16 @@ jobs:
           }
           if (-not (Test-Path game\OptiScaler.ini.d4r-backup)) { throw "no OptiScaler.ini backup" }
           if (-not $out.Contains("ok       OptiScaler.ini: set")) { throw "setup did not report the OptiScaler.ini change" }
+      - name: test-dlss.ps1 without an AMD GPU or NVIDIA's files (runs to its report)
+        shell: powershell
+        run: |
+          $out = powershell -ExecutionPolicy Bypass -File game\d4r\test-dlss.ps1 -GameFolder game -Frames 2 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1 (no DLSS on this runner), got $LASTEXITCODE" }
+          foreach ($line in "VRAM sharing check", "harness exit code", "DLSS did not complete") {
+            if (-not $out.Contains($line)) { throw "missing in the output: $line" }
+          }
+          if (-not (Test-Path game\d4r\interop-report.txt)) { throw "no d4r\interop-report.txt" }
       - name: Collect logs
         shell: powershell
         run: |

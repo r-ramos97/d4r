@@ -133,7 +133,7 @@ if (Test-Path -LiteralPath $dlss -PathType Leaf) {
     if ($info.FileMajorPart -eq 310 -and ($info.FileMinorPart -eq 7 -or $info.FileMinorPart -eq 9)) {
         Ok "d4r\nvngx_dlss.dll (DLSS $dlssVersion; native kernels written for 310.7 and 310.9)"
     }
-    else { Note "d4r\nvngx_dlss.dll is DLSS $dlssVersion: kernels whose code changed run without native kernels (slower)" }
+    else { Note "d4r\nvngx_dlss.dll is DLSS ${dlssVersion}: kernels whose code changed run without native kernels (slower)" }
 }
 else { Bad "d4r\nvngx_dlss.dll: copy NVIDIA's DLSS library (310.7 or 310.9 recommended) here" }
 if (Test-Path -LiteralPath (Join-Path $d4r "ngx\_nvngx.dll") -PathType Leaf) { Ok "d4r\ngx\_nvngx.dll (NVIDIA's NGX runtime)" }
