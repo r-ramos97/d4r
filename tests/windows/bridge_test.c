@@ -215,6 +215,21 @@ int main(int argc, char** argv)
     check(waited == 7 && signalled == 8 && waitStream == NULL, "fence values on the null stream, where NGX runs", "");
     check(memoryDestroyed && semaphoreDestroyed, "HIP releases both imports", "");
 
+    /* the GPU-side release of a same-frame wait: a null-stream write, on the GPU DLSS runs on */
+    typedef int(WINAPI * StreamWriteFn)(uint64_t, uint32_t);
+    typedef void (*WriteFn)(int*, void**, void**, unsigned*);
+    StreamWriteFn streamWrite = (StreamWriteFn)(void*)GetProcAddress(bridge, "d4rStreamWriteValue32");
+    WriteFn written = (WriteFn)(void*)GetProcAddress(hip, "mock_hip_write");
+    int writeDevice = -1;
+    void *writeStream = (void*)1, *writePointer = NULL;
+    unsigned writeValue = 0;
+    check(streamWrite != NULL && written != NULL && streamWrite(0x5000, 42) == 0, "d4rStreamWriteValue32 queues", "");
+    if (written != NULL)
+        written(&writeDevice, &writeStream, &writePointer, &writeValue);
+    check(writeStream == NULL && writePointer == (void*)(uintptr_t)0x5000 && writeValue == 42,
+          "the write goes to HIP's null stream", "");
+    check(writeDevice == 1, "raw HIP calls run on the GPU DLSS runs on (hipSetDevice)", "");
+
     printf("%d failure(s)\n", failures);
     return failures != 0;
 }

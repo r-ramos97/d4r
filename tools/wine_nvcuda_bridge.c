@@ -2848,6 +2848,21 @@ static void* hip_symbol(const char* name)
     return hip != NULL ? dlsym(hip, name) : NULL;
 }
 
+/* Raw HIP calls act on the calling thread's current HIP device, which is device 0 on a thread without a ZLUDA
+   context (the shim's helper threads); on Windows that can be an integrated GPU. The d4r helpers that use HIP
+   directly first select the GPU DLSS runs on. */
+static void bind_ngx_device(void)
+{
+#ifdef D4R_NATIVE_WINDOWS
+    typedef int (*HIP_SET_DEVICE_FN)(int);
+    static HIP_SET_DEVICE_FN set_device;
+    if (set_device == NULL)
+        set_device = (HIP_SET_DEVICE_FN)hip_symbol("hipSetDevice");
+    if (set_device != NULL && ngx_device() >= 0)
+        set_device(ngx_device());
+#endif
+}
+
 CUresult WINAPI d4rImportVulkanMemory(void* client_device, uint64_t client_memory, uint64_t bytes, CUdeviceptr* pointer,
                                       void** memory)
 {
@@ -2988,6 +3003,7 @@ CUresult WINAPI d4rStreamWaitValue32(CUdeviceptr pointer, uint32_t value)
         function = (HIP_STREAM_WAIT_VALUE32_FN)hip_symbol("hipStreamWaitValue32");
     if (function == NULL)
         return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
     const int result = function(NULL, (void*)(uintptr_t)pointer, value, 0 /* hipStreamWaitValueGte */, 0xffffffffu);
     if (result != 0 || trace_verbose())
         tracef("d4rStreamWaitValue32 %p >= %u result=%d", (void*)(uintptr_t)pointer, value, result);
@@ -3006,6 +3022,7 @@ CUresult WINAPI d4rWriteValue32(CUdeviceptr pointer, uint32_t value)
     pthread_mutex_lock(&lock);
     if (stream == NULL)
     {
+        bind_ngx_device(); /* the stream belongs to the device current at its creation */
         HIP_STREAM_CREATE_WITH_FLAGS_FN create = (HIP_STREAM_CREATE_WITH_FLAGS_FN)hip_symbol("hipStreamCreateWithFlags");
         write = (HIP_STREAM_WRITE_VALUE32_FN)hip_symbol("hipStreamWriteValue32");
         sync = (HIP_STREAM_SYNCHRONIZE_FN)hip_symbol("hipStreamSynchronize");
@@ -3017,6 +3034,25 @@ CUresult WINAPI d4rWriteValue32(CUdeviceptr pointer, uint32_t value)
         result = sync(stream);
     pthread_mutex_unlock(&lock);
     tracef("d4rWriteValue32 %p = %u result=%d", (void*)(uintptr_t)pointer, value, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+}
+
+/* d4r: queues on the null stream, after everything queued before it (DLSS's output copy), a write of `value` to
+   the u32 at `pointer`: on native Windows the game's command list waits on the GPU for it (same-frame results). */
+CUresult WINAPI d4rStreamWriteValue32(CUdeviceptr pointer, uint32_t value)
+{
+    static HIP_STREAM_WRITE_VALUE32_FN function;
+    ensure_context();
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    if (function == NULL)
+        function = (HIP_STREAM_WRITE_VALUE32_FN)hip_symbol("hipStreamWriteValue32");
+    if (function == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
+    const int result = function(NULL, (void*)(uintptr_t)pointer, value, 0);
+    if (result != 0 || trace_verbose())
+        tracef("d4rStreamWriteValue32 %p = %u result=%d", (void*)(uintptr_t)pointer, value, result);
     return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
 
@@ -3067,6 +3103,7 @@ CUresult WINAPI d4rImportWin32Memory(void* handle, uint32_t type, uint64_t bytes
         return CUDA_ERROR_INVALID_VALUE;
     if (context_setup_result != CUDA_SUCCESS)
         return context_setup_result;
+    bind_ngx_device();
     HIP_IMPORT_EXTERNAL_MEMORY_FN import = (HIP_IMPORT_EXTERNAL_MEMORY_FN)hip_symbol("hipImportExternalMemory");
     HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN map =
         (HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN)hip_symbol("hipExternalMemoryGetMappedBuffer");
@@ -3173,6 +3210,7 @@ CUresult WINAPI d4rImportWin32Semaphore(void* handle, uint32_t type, void** sema
         (HIP_IMPORT_EXTERNAL_SEMAPHORE_FN)hip_symbol("hipImportExternalSemaphore");
     if (import == NULL)
         return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
     D4rHipExternalSemaphoreHandleDesc desc;
     memset(&desc, 0, sizeof(desc));
     desc.type = (int)type;
@@ -3193,6 +3231,7 @@ static CUresult external_semaphore(const char* function_name, void* semaphore, u
     HIP_EXTERNAL_SEMAPHORES_FN function = (HIP_EXTERNAL_SEMAPHORES_FN)hip_symbol(function_name);
     if (function == NULL)
         return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
     D4rHipExternalSemaphoreParams params;
     memset(&params, 0, sizeof(params));
     params.params.fence.value = value;

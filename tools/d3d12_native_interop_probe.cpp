@@ -11,7 +11,10 @@
 //   3. GPU-side ordering without the CPU: a shared D3D12 fence imported as a HIP external semaphore
 //      (d4rWaitSemaphore / d4rSignalSemaphore), and a marker that D3D12's WriteBufferImmediate writes into the
 //      shared buffer and HIP's stream waits for (d4rStreamWaitValue32, the Proton path's mechanism);
-//   4. timings: VRAM copies against today's readback copy.
+//   4. timings: VRAM copies against today's readback copy;
+//   5. same-frame results (FrameAge = 0): the GPU-side wait of tools/d4r_d3d12_inline.h inside one D3D12 command
+//      list, released by HIP (d4rStreamWriteValue32) after HIP itself waited for a D3D12 marker, and the cost of
+//      one spin of the wait.
 //
 // usage: d4r-interop-probe.exe NVCUDA_BRIDGE_DLL [WIDTH HEIGHT]   (D4R_PROBE_ADAPTER=warp: software D3D12)
 // Exit code 0: memory is shared both ways (the VRAM path can be built); 1: it is not; 2: setup failed.
@@ -19,6 +22,8 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+
+#include "d4r_d3d12_inline.h"
 
 #include <algorithm>
 #include <chrono>
@@ -65,6 +70,7 @@ struct Bridge
     using QueryFn = CUresult(WINAPI*)(void*);
     using AllocFn = CUresult(WINAPI*)(CUdeviceptr*, size_t);
     using FreeFn = CUresult(WINAPI*)(CUdeviceptr);
+    using StreamWriteFn = CUresult(WINAPI*)(CUdeviceptr, uint32_t);
 
     SetEnvFn setEnv;
     LoadErrorFn loadError;
@@ -88,6 +94,7 @@ struct Bridge
     QueryFn streamQuery;
     AllocFn alloc;
     FreeFn free;
+    StreamWriteFn streamWrite; // optional: newer bridges
 };
 
 template <typename T> bool resolve(HMODULE module, const char* name, T& function)
@@ -151,11 +158,13 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 size)
 }
 
 ID3D12Resource* create_buffer(D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_STATES state,
-                              D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE)
+                              D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE,
+                              D3D12_RESOURCE_FLAGS resourceFlags = D3D12_RESOURCE_FLAG_NONE)
 {
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = type;
-    const D3D12_RESOURCE_DESC desc = buffer_desc(size);
+    D3D12_RESOURCE_DESC desc = buffer_desc(size);
+    desc.Flags = resourceFlags;
     ID3D12Resource* resource = nullptr;
     if (!check(g_device->CreateCommittedResource(&heap, flags, &desc, state, nullptr, __uuidof(ID3D12Resource),
                                                  reinterpret_cast<void**>(&resource)),
@@ -204,6 +213,27 @@ std::string adapter_name(LUID luid)
 const char* verdict(bool ok)
 {
     return ok ? "PASS" : "FAIL";
+}
+
+bool memory_shared(bool toCuda, bool toD3D12)
+{
+    return toCuda && toD3D12;
+}
+
+// u64 words of a readback buffer that differ from `expected`; all of them if it cannot be mapped
+size_t words_in(ID3D12Resource* readback, UINT64 bytes, uint64_t expected)
+{
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, static_cast<SIZE_T>(bytes)};
+    if (FAILED(readback->Map(0, &range, &mapped)))
+        return static_cast<size_t>(bytes / 8);
+    size_t wrong = 0;
+    const uint64_t* words = static_cast<const uint64_t*>(mapped);
+    for (UINT64 i = 0; i < bytes / 8; ++i)
+        wrong += words[i] != expected;
+    D3D12_RANGE none = {0, 0};
+    readback->Unmap(0, &none);
+    return wrong;
 }
 
 // polls the null stream until its work is done; false after timeoutMs
@@ -309,6 +339,8 @@ int main(int argc, char** argv)
                    resolve(bridge, "cuMemFree", cuda.free);
     if (!exports)
         return 2;
+    cuda.streamWrite = reinterpret_cast<Bridge::StreamWriteFn>(
+        reinterpret_cast<void*>(GetProcAddress(bridge, "d4rStreamWriteValue32")));
     char value[24];
     std::snprintf(value, sizeof(value), "0x%08lx", static_cast<unsigned long>(luid.LowPart));
     cuda.setEnv("D4R_CUDA_LUID_LOW", value, 1);
@@ -655,15 +687,141 @@ int main(int argc, char** argv)
         std::printf("  CUDA device -> host (today):           %8.3f ms\n\n", cudaToHost);
     }
 
-    const bool memory = toCuda && toD3D12;
-    std::printf("RESULT: VRAM sharing %s (%s), GPU sync: shared fence %s, marker %s\n", memory ? "works" : "FAILS",
-                importKind, fenceSync ? "works" : "no", markerSync ? "works" : "no");
-    if (memory && (fenceSync || markerSync))
-        std::printf("The VRAM path is possible on this PC: DLSS inputs and output can stay in VRAM, ordered on the GPU.\n");
-    else if (memory)
-        std::printf("VRAM sharing works, but the GPU-side wait does not: a VRAM path would need CPU waits.\n");
+    // 5. same-frame results: one command list waits on the GPU for HIP, as d4r's FrameAge = 0 does
+    std::printf("5. Same-frame results (FrameAge = 0): a D3D12 command list waits on the GPU for HIP\n");
+    bool sameFrame = false;
+    double nsPerSpin = -1.0;
+    d4r_inline::Presenter presenter;
+    std::string presenterError;
+    struct SharedBuffer
+    {
+        ID3D12Resource* resource = nullptr;
+        CUdeviceptr device = 0;
+        void* external = nullptr;
+    };
+    auto make_shared = [&](UINT64 size, SharedBuffer& out) {
+        out.resource = create_buffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON,
+                                     D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        HANDLE shared = nullptr;
+        if (out.resource == nullptr ||
+            FAILED(g_device->CreateSharedHandle(out.resource, nullptr, GENERIC_ALL, nullptr, &shared)))
+            return false;
+        const D3D12_RESOURCE_DESC desc = out.resource->GetDesc();
+        const UINT64 allocation = g_device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        const CUresult imported = cuda.importMemory(shared, 5, allocation, &out.device, &out.external);
+        CloseHandle(shared);
+        return imported == 0;
+    };
+    SharedBuffer status, slots[d4r_inline::kSlots], present;
+    if (hung || !memory_shared(toCuda, toD3D12))
+        std::printf("  skipped: needs VRAM sharing\n");
+    else if (cuda.streamWrite == nullptr)
+        std::printf("  skipped: this nvcuda.dll has no d4rStreamWriteValue32\n");
+    else if (!presenter.init(g_device, presenterError))
+        std::printf("  the wait's shaders: FAIL (%s)\n", presenterError.c_str());
+    else
+    {
+        bool ok = make_shared(d4r_inline::kStatusBytes, status) && make_shared(bytes, present);
+        for (SharedBuffer& slot : slots)
+            ok = ok && make_shared(bytes, slot);
+        ID3D12Resource* slotResources[d4r_inline::kSlots];
+        for (int slot = 0; slot < d4r_inline::kSlots; ++slot)
+            slotResources[slot] = slots[slot].resource;
+        ID3D12Resource* statusReadback = create_buffer(D3D12_HEAP_TYPE_READBACK, d4r_inline::kStatusBytes,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12GraphicsCommandList2* waitList = nullptr;
+        ok = ok && statusReadback != nullptr &&
+             SUCCEEDED(g_list->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&waitList)));
+        CUresult hip = ok ? cuda.memset32(status.device, 0, d4r_inline::kStatusBytes / 4) : -1;
+        for (SharedBuffer& slot : slots)
+            if (hip == 0)
+                hip = cuda.memset32(slot.device, 0, bytes / 4);
+        if (hip == 0)
+            hip = cuda.synchronize();
+        // HIP: wait for D3D12's marker (status word 8), write slot 0, release frame 7
+        const uint32_t frame = 7;
+        const CUdeviceptr gate = status.device + 32;
+        if (hip == 0)
+            hip = cuda.waitValue(gate, 1);
+        if (hip == 0)
+            hip = cuda.memset32Async(slots[0].device, fill, bytes / 4, nullptr);
+        if (hip == 0)
+            hip = cuda.streamWrite(status.device + 4 * (d4r_inline::kProduced + 0), frame);
+        if (hip == 0)
+            hip = cuda.streamWrite(status.device + 4 * d4r_inline::kReleased, frame);
+        if (ok && hip == 0)
+        {
+            // D3D12: the marker, then the wait and the copy into the present buffer, as the shim records them
+            transition(status.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER parameter = {status.resource->GetGPUVirtualAddress() + 32, 1};
+            D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            waitList->WriteBufferImmediate(1, &parameter, &mode);
+            transition(status.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            presenter.record(g_list, status.resource, slotResources, present.resource, frame, bytes, 50000000);
+            g_list->CopyBufferRegion(readback, 0, present.resource, 0, bytes);
+            transition(present.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            g_list->CopyBufferRegion(statusReadback, 0, status.resource, 0, d4r_inline::kStatusBytes);
+            const auto start = std::chrono::steady_clock::now();
+            const bool done = submit() && wait_queue(10000);
+            const double roundTrip = elapsed_ms(start);
+            if (!done)
+            {
+                hung = true;
+                cuda.writeValue(gate, 1);
+                cuda.writeValue(status.device + 4 * d4r_inline::kReleased, frame);
+                wait_queue(10000);
+            }
+            reset_list();
+            uint32_t statusWords[d4r_inline::kStatusWords] = {};
+            size_t wrong = words_in(readback, bytes, fillWord);
+            void* mappedStatus = nullptr;
+            D3D12_RANGE statusRange = {0, static_cast<SIZE_T>(d4r_inline::kStatusBytes)};
+            if (SUCCEEDED(statusReadback->Map(0, &statusRange, &mappedStatus)))
+            {
+                std::memcpy(statusWords, mappedStatus, sizeof(statusWords));
+                statusReadback->Unmap(0, &none);
+            }
+            sameFrame = done && wrong == 0 && statusWords[d4r_inline::kChosen] == 0 && statusWords[d4r_inline::kSpins] < 50000000;
+            std::printf("  HIP released the wait, D3D12 copied HIP's result: %s (slot %d, %u spins, %zu of %llu texels "
+                        "wrong, %.3f ms)\n", verdict(sameFrame), static_cast<int>(statusWords[d4r_inline::kChosen]),
+                        statusWords[d4r_inline::kSpins], wrong, static_cast<unsigned long long>(words), roundTrip);
+
+            // the cost of one spin: a wait for a frame nobody releases, up to a fixed number of spins
+            if (!hung)
+            {
+                const uint32_t spins = 1000000;
+                presenter.record(g_list, status.resource, slotResources, present.resource, frame + 1, 16, spins);
+                transition(present.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                const auto spinStart = std::chrono::steady_clock::now();
+                if (submit() && wait_queue(10000))
+                    nsPerSpin = elapsed_ms(spinStart) * 1e6 / spins;
+                reset_list();
+                if (nsPerSpin > 0)
+                    std::printf("  one spin of the wait: %.1f ns; d4r's limit (D4R_SHIM_INLINE_SPINS, 2000000 spins) "
+                                "ends a lost frame's wait after %.0f ms\n", nsPerSpin, nsPerSpin * 2000000 / 1e6);
+            }
+        }
+        else
+            std::printf("  setting it up failed (D3D12 %s, HIP result %d)\n", ok ? "ok" : "failed", hip);
+        if (waitList != nullptr)
+            waitList->Release();
+    }
+    std::printf("  same-frame wait: %s\n\n", verdict(sameFrame));
+
+    const bool memory = memory_shared(toCuda, toD3D12);
+    std::printf("RESULT: VRAM sharing %s (%s), GPU sync: shared fence %s, marker %s, same-frame wait %s\n",
+                memory ? "works" : "FAILS", importKind, fenceSync ? "works" : "no", markerSync ? "works" : "no",
+                sameFrame ? "works" : "no");
+    if (memory)
+        std::printf("VRAM sharing works on this PC: d4r keeps DLSS's inputs and output in video memory "
+                    "(VramInterop in d4r\\d4r.ini).\n");
     else
         std::printf("d4r keeps copying through host memory on this PC.\n");
+    if (sameFrame)
+        std::printf("Same-frame results work on this PC: FrameAge = 0 in d4r\\d4r.ini shows each frame's own DLSS "
+                    "result.\n");
+    else
+        std::printf("Same-frame results do not work here: keep FrameAge = 1 or more in d4r\\d4r.ini.\n");
     std::printf("Please report this output (docs/windows.md).\n");
     std::fflush(stdout);
     // a wait that never returned may still hold a GPU queue; skip the teardown that would wait for it

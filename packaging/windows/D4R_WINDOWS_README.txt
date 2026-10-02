@@ -7,12 +7,12 @@ DLSS calls, d4r runs NVIDIA's DLSS through ZLUDA (CUDA on AMD's HIP), with the h
 network layers replaced by kernels written for RDNA3 and RDNA4.
 
 Status: the Windows build is new and has not run on a real GPU yet. Every part was tested against mock
-libraries on Windows and Wine; the first runs on real hardware will find what is still missing. Compared
-with the Linux release it has one built-in difference: each frame shows the newest finished DLSS result,
-one frame or more old, because the same-frame mode needs a patched vkd3d-proton that only exists under
-Proton. DLSS's inputs and output stay in video memory when AMD's driver lets HIP share it with D3D12
-(test-dlss.ps1 checks that first); otherwise they are copied through system memory, which costs some
-speed. docs/windows.md in the source repository explains the design and the plan.
+libraries on Windows and Wine; the first runs on real hardware will find what is still missing. By default
+each frame shows the newest finished DLSS result, one frame old (FrameAge = 1). FrameAge = 0 in
+d4r\d4r.ini shows each frame's own result (experimental: the game's GPU work waits for DLSS). DLSS's
+inputs and output stay in video memory when AMD's driver lets HIP share it with D3D12; otherwise they are
+copied through system memory, which costs some speed. test-dlss.ps1 checks both on your PC first.
+docs/windows.md in the source repository explains the design and the plan.
 
 
 What you need
@@ -57,7 +57,8 @@ compiled. ZLUDA caches them in %LOCALAPPDATA%\zluda, so later starts are quick.
 Settings
 --------
 d4r\d4r.ini holds d4r's settings for the game: the DLSS model (K: DLSS 4, default; E: DLSS 3 CNN; M:
-DLSS 4.5), FrameAge (1 = least latency, 2-3 = more fps), PreferAccuracy and, on RDNA4, NativeFp8. The
+DLSS 4.5), FrameAge (0 = each frame's own result, experimental; 1 = one frame old, the default; 2-3 =
+more fps), PreferAccuracy and, on RDNA4, NativeFp8. The
 file explains each one. Restart the game after a change.
 
 PCs with two AMD GPUs (for example a Ryzen 7000/9000 with its integrated graphics enabled and a Radeon

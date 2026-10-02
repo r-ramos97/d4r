@@ -65,10 +65,31 @@ NGX gets.
 
 Under Proton the d4r vkd3d-proton patch splits the game's command list at the DLSS call, so every frame shows
 its own result, and Vulkan interop keeps inputs and output in VRAM. AMD's D3D12 driver cannot split a command
-list, so on Windows each frame shows the newest finished result, one frame or more old: the shim copies the
-inputs on the game's command list, writes a frame marker (`WriteBufferImmediate`), runs DLSS when the marker
-arrives, and copies the newest finished result into the output. The Windows `d4r.ini` sets `FrameAge = 1`, one
-frame in flight, the lowest latency on this path.
+list. By default (`FrameAge = 1`) each frame on Windows shows the newest finished result, one frame old: the
+shim copies the inputs on the game's command list, writes a frame marker (`WriteBufferImmediate`), runs DLSS
+when the marker arrives, and copies the newest finished result into the output.
+
+### Same-frame results (`FrameAge = 0`, experimental)
+
+Instead of splitting the list, the list waits on the GPU (`tools/d4r_d3d12_inline.h`). After the input copies
+and a marker that DLSS's HIP stream waits for (`d4rStreamWaitValue32`, as Proton's `GpuWait`), the shim records
+two compute dispatches on the game's command list:
+
+1. `wait_main`, one thread, spins with atomic loads until a "released" value in a shared status buffer reaches
+   the frame, or until a spin limit (`D4R_SHIM_INLINE_SPINS`, 2000000). It then picks the output slot whose
+   result is the newest not newer than the frame: normally the frame's own;
+2. `copy_main` copies that slot into a present buffer, which a `CopyTextureRegion` puts into the game's output.
+
+On the HIP side, the worker queues behind DLSS's output copy two null-stream writes (`d4rStreamWriteValue32`):
+the frame number of the slot, then the released frame. HIP's queues run alongside the graphics queue, so DLSS
+progresses while the graphics queue spins. A frame without a result (dropped) is released by the CPU, and the
+split-frame watchdog releases a frame whose wait lasted over 200 ms; either way the wait then shows the newest
+older result. The shaders are HLSL compiled at runtime by Windows' `d3dcompiler_47.dll`, with the root signature
+in the HLSL; recording them changes the list's compute root signature and pipeline state, as a DLSS evaluation
+may. The Windows CI runs them on WARP (`tests/windows/inline_test.cpp`), and `d4r-interop-probe.exe` checks the
+whole chain (D3D12 marker → HIP wait → HIP release → D3D12 wait and copy) on the user's GPU and measures a spin.
+Without VRAM interop, or if the shaders or the bridge's export are missing, the shim logs why and stays at
+`FrameAge = 1` behaviour.
 
 ### VRAM interop
 
@@ -159,9 +180,10 @@ ones), `d4r\interop-report.txt`, `OptiScaler.log`.
 - **OptiScaler's NVIDIA check** on Windows with d4r's NVAPI.
 - **HIP on Windows** for what ZLUDA uses for DLSS: texture and surface objects, the d4r patches' launches, and
   loading the native code objects (built with ROCm on Linux) through the Windows HIP runtime.
-- **Same-frame results.** Without vkd3d-proton's split, a D3D12-level equivalent would need the game's queue: a
-  hook on `ExecuteCommandLists` cannot split a list the game is still recording into, so this stays a frame late
-  unless the game's own frame structure allows otherwise.
+- **Same-frame results on AMD's driver.** The GPU-side wait needs HIP's queues to run while the graphics
+  queue spins, and HIP's null-stream writes to be visible to the shader's atomics; the probe's step 5 checks
+  both. Games that do not restore their compute root signature after DLSS would be affected by the wait's
+  dispatches (as by DLSS itself on NVIDIA hardware).
 - **VRAM interop on AMD's driver.** The shared-buffer path and the probe are written against the HIP and D3D12
   documentation and tested with mocks; the probe's report on real hardware says whether the import works, and
   a shared fence or the marker wait would let DLSS start on the GPU without the CPU polling the frame marker.

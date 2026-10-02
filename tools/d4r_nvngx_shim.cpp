@@ -38,6 +38,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <vulkan/vulkan_core.h>
+#include "d4r_d3d12_inline.h"
 
 #include <algorithm>
 #include <bit>
@@ -236,6 +237,8 @@ struct CudaApi
     // Optional (d4r nvcuda bridge): null-stream wait for a device u32, and a write from another stream.
     int(WINAPI* streamWaitValue32)(CudaDevicePtr, uint32_t) = nullptr;
     int(WINAPI* writeValue32)(CudaDevicePtr, uint32_t) = nullptr;
+    // Optional (d4r nvcuda bridge): a u32 write queued on the null stream (native Windows same-frame results).
+    int(WINAPI* streamWriteValue32)(CudaDevicePtr, uint32_t) = nullptr;
     // Optional (d4r nvcuda bridge): surfaces of an array store to linear memory instead (d4r native kernels).
     int(WINAPI* setArrayRedirect)(CudaArray, CudaDevicePtr, uint32_t) = nullptr;
     int(WINAPI* outputKernelNative)() = nullptr;
@@ -1373,6 +1376,8 @@ static bool load_libraries()
     if (!load_export(g.cuda, "d4rStreamWaitValue32", g.cu.streamWaitValue32) ||
         !load_export(g.cuda, "d4rWriteValue32", g.cu.writeValue32))
         g.cu.streamWaitValue32 = nullptr, g.cu.writeValue32 = nullptr;
+    if (!load_export(g.cuda, "d4rStreamWriteValue32", g.cu.streamWriteValue32))
+        g.cu.streamWriteValue32 = nullptr;
     if (!load_export(g.cuda, "d4rSetArrayRedirect", g.cu.setArrayRedirect))
         g.cu.setArrayRedirect = nullptr;
     if (!load_export(g.cuda, "d4rOutputKernelNative", g.cu.outputKernelNative))
@@ -1508,6 +1513,7 @@ constexpr int kSlots = 3;
 // One more result slot than input slots: a slot is reused only once the GPU
 // is past every command list that copies from it (see claim_output_slot).
 constexpr int kOutputSlots = kSlots + 1;
+static_assert(kOutputSlots == d4r_inline::kSlots, "the same-frame wait shader reads every output slot");
 
 // A VkBuffer in device-local memory on vkd3d-proton's VkDevice, exported to
 // the CUDA side (see "VRAM interop").
@@ -1673,6 +1679,12 @@ struct Feature
     // the frame marker before any DLSS work is queued.
     bool gpuWait = false;
     VramBuffer gpuMarker;
+    // Native Windows split frames (tools/d4r_d3d12_inline.h): instead of splitting the command list, it waits on
+    // the GPU for inlineStatus (released frame, frame held by each output slot), which HIP writes after DLSS, and
+    // copies the newest result into inlinePresent, and from there into the game's output.
+    VramBuffer inlineStatus, inlinePresent;
+    // Waits that ended without their frame's result (spin limit, watchdog): a few switch the wait off.
+    std::atomic<int> inlineTimeouts{0};
     // Frame the null stream currently waits for (0: none) and since when; the watchdog releases a wait for a
     // frame whose command list never reaches the GPU (e.g. recorded but not executed), so DLSS cannot stall.
     std::atomic<uint32_t> gpuWaitFrame{0};
@@ -2345,6 +2357,7 @@ static bool create_d3d12_vram_buffer(VramBuffer& target, size_t bytes)
     desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; // the same-frame wait's status and present buffers
     HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                    nullptr, __uuidof(ID3D12Resource),
                                                    reinterpret_cast<void**>(&buffer.d3d12));
@@ -2730,6 +2743,19 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
                 buffer_location(slot.vram[index].d3d12, copies[index], slot.host[index].rowBytes);
             list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         }
+        if (feature.gpuWait)
+        {
+            // once the copies above are done: DLSS's stream waits on the GPU for this value
+            ID3D12GraphicsCommandList2* list2 = nullptr;
+            if (FAILED(list->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&list2))))
+                return false;
+            transition(list, feature.gpuMarker.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER marker = {feature.gpuMarker.d3d12->GetGPUVirtualAddress(), frame};
+            D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            list2->WriteBufferImmediate(1, &marker, &mode);
+            list2->Release();
+            transition(list, feature.gpuMarker.d3d12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        }
         return true;
     }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -2848,6 +2874,71 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
     return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
 }
 
+// --- Same-frame results on native Windows (tools/d4r_d3d12_inline.h) ------------------
+//
+// FrameAge = 0 on Windows: the game's command list waits on the GPU, after the input copies, until HIP releases
+// the frame (d4rStreamWriteValue32 after DLSS's output copy), then copies the newest result not newer than the
+// frame into the output. The split-frame bookkeeping below (output slot frame % kOutputSlots, release of dropped
+// frames, the watchdog) is shared with Proton's split frames; only the release mechanism differs.
+
+static d4r_inline::Presenter g_inline;
+static std::once_flag g_inlineOnce;
+static bool g_inlineReady = false;
+
+static uint32_t inline_max_spins()
+{
+    // spins of one atomic load each: a fraction of a second on a desktop GPU, far below Windows' GPU timeout
+    static const uint32_t spins = env_uint("D4R_SHIM_INLINE_SPINS", 2000000);
+    return spins;
+}
+
+static void start_split_watchdog();
+
+// Game thread, once per feature.
+static bool init_inline_wait(Feature& feature)
+{
+    std::call_once(g_inlineOnce, [] {
+        std::string error;
+        g_inlineReady = g.cu.streamWriteValue32 != nullptr && g.cu.writeValue32 != nullptr && g_inline.init(g.device, error);
+        if (!g_inlineReady)
+            logf("same-frame results unavailable: %s; each frame shows the newest finished result",
+                 g.cu.streamWriteValue32 == nullptr ? "the nvcuda bridge has no d4rStreamWriteValue32" : error.c_str());
+    });
+    if (!g_inlineReady || !create_vram_buffer(feature.inlineStatus, d4r_inline::kStatusBytes))
+        return false;
+    // a pooled buffer holds an earlier feature's frames
+    const int cleared = g.worker.call([&feature] {
+        int result = 0;
+        for (uint32_t word = 0; word < d4r_inline::kStatusWords && result == 0; ++word)
+            result = g.cu.writeValue32(feature.inlineStatus.device + 4 * word, 0);
+        return result;
+    });
+    if (cleared != 0)
+    {
+        logf("same-frame results: clearing the status buffer failed (%d)", cleared);
+        recycle_vram_buffer(feature.inlineStatus);
+        return false;
+    }
+    start_split_watchdog(); // releases frames that never got their result
+    return true;
+}
+
+// Records the GPU-side wait for `frame` and the copy of the result into `output` (in COPY_DEST state).
+static void record_inline_output(ID3D12GraphicsCommandList* list, Feature& feature, const VramCopy& output,
+                                 uint32_t frame)
+{
+    ID3D12Resource* slots[d4r_inline::kSlots];
+    for (int slot = 0; slot < d4r_inline::kSlots; ++slot)
+        slots[slot] = feature.outputs[slot].vram.d3d12;
+    const size_t pitch = vram_output_pitch(output.width);
+    g_inline.record(list, feature.inlineStatus.d3d12, slots, feature.inlinePresent.d3d12, frame,
+                    pitch * output.height, inline_max_spins());
+    const D3D12_TEXTURE_COPY_LOCATION destination = texture_location(output.resource);
+    const D3D12_TEXTURE_COPY_LOCATION source = buffer_location(feature.inlinePresent.d3d12, output, pitch);
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    transition(list, feature.inlinePresent.d3d12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
 // --- Split frames -------------------------------------------------------------------
 //
 // To present frame N's own result, everything the game records after its DLSS
@@ -2864,6 +2955,20 @@ static void signal_split(Feature* feature, uint64_t value, const char* reason)
     std::lock_guard<std::mutex> lock(feature->splitMutex);
     if (value <= feature->splitSignalled)
         return;
+    if (g_vk.native)
+    {
+        // A frame without a result of its own (dropped, or late for the watchdog): release the GPU-side wait from
+        // the CPU; the wait then shows the newest older result. Frames with a result were released on the GPU.
+        const int result = g.cu.writeValue32(feature->inlineStatus.device + 4 * d4r_inline::kReleased,
+                                             static_cast<uint32_t>(value));
+        feature->splitSignalled = value;
+        if (reason != nullptr)
+            ++feature->inlineTimeouts;
+        if (result != 0 || reason != nullptr)
+            logf("split frame %llu released%s%s (result %d)", static_cast<unsigned long long>(value),
+                 reason != nullptr ? " by " : "", reason != nullptr ? reason : "", result);
+        return;
+    }
     VkSemaphoreSignalInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
     info.semaphore = feature->splitSemaphore;
     info.value = value;
@@ -2933,6 +3038,12 @@ static void split_watchdog()
     }
 }
 
+static void start_split_watchdog()
+{
+    static std::once_flag watchdog;
+    std::call_once(watchdog, [] { std::thread(split_watchdog).detach(); });
+}
+
 static bool create_split_semaphore(Feature& feature)
 {
     VkSemaphoreTypeCreateInfo type = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -2944,8 +3055,7 @@ static bool create_split_semaphore(Feature& feature)
         logf("split frames: vkCreateSemaphore failed");
         return false;
     }
-    static std::once_flag watchdog;
-    std::call_once(watchdog, [] { std::thread(split_watchdog).detach(); });
+    start_split_watchdog();
     return true;
 }
 
@@ -2981,6 +3091,8 @@ static void release_vram(Feature& feature)
     for (OutputSlot& slot : feature.outputs)
         recycle_vram_buffer(slot.vram);
     recycle_vram_buffer(feature.gpuMarker);
+    recycle_vram_buffer(feature.inlineStatus);
+    recycle_vram_buffer(feature.inlinePresent);
     for (VramBuffer& buffer : feature.retiredBuffers)
         recycle_vram_buffer(buffer);
     feature.retiredBuffers.clear();
@@ -3880,6 +3992,45 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     copy.WidthInBytes = rowBytes;
     copy.Height = feature->output.height;
     int result = pitch * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
+    if (result == 0 && params.split && g_vk.native)
+    {
+        // Native same-frame results: release the game's GPU-side wait right behind the output copy, on the GPU.
+        const CudaDevicePtr status = feature->inlineStatus.device;
+        int released = g.cu.streamWriteValue32(status + 4 * (d4r_inline::kProduced + target), frame);
+        if (released == 0)
+            released = g.cu.streamWriteValue32(status + 4 * d4r_inline::kReleased, frame);
+        if (released == 0)
+        {
+            std::lock_guard<std::mutex> lock(feature->splitMutex);
+            if (frame > feature->splitSignalled)
+                feature->splitSignalled = frame;
+        }
+        else
+            logf("frame %u: queueing the GPU-side release failed: %d", frame, released);
+        // How long the game's GPU-side waits spin, from the status buffer (the wait of an earlier frame, which has
+        // run by now): at the spin limit the wait ended without its result.
+        static const bool always = env_uint("D4R_SHIM_INLINE_TRACE", 0) != 0;
+        if (always || frame <= 8 || frame % 300 == 0)
+        {
+            uint32_t words[d4r_inline::kStatusWords] = {};
+            CudaMemcpy2D read = {};
+            read.srcMemoryType = CUDA_MEMORY_DEVICE;
+            read.srcDevice = status;
+            read.dstMemoryType = CUDA_MEMORY_HOST;
+            read.dstHost = words;
+            read.WidthInBytes = sizeof(words);
+            read.Height = 1;
+            if (g.cu.memcpy2D(&read) == 0 && words[d4r_inline::kChosen] != d4r_inline::kNoSlot)
+            {
+                const bool limit = words[d4r_inline::kSpins] >= inline_max_spins();
+                if (limit)
+                    ++feature->inlineTimeouts;
+                logf("frame %u: same-frame wait of an earlier frame spun %u times%s (released %u, slot %u)", frame,
+                     words[d4r_inline::kSpins], limit ? ", the limit: no result in time" : "",
+                     words[d4r_inline::kReleased], words[d4r_inline::kChosen]);
+            }
+        }
+    }
     if (result == 0)
     {
         const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -4811,10 +4962,11 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     {
         feature->vramDecided = true;
         feature->vram = p.vram;
-        feature->split = p.vram && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 && g_vk.split != nullptr &&
-                         create_split_semaphore(*feature);
+        feature->split = p.vram && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 &&
+                         (g_vk.native ? init_inline_wait(*feature)
+                                      : g_vk.split != nullptr && create_split_semaphore(*feature));
         if (feature->split && env_uint("D4R_SHIM_GPU_WAIT", 0) != 0 && g.cu.streamWaitValue32 != nullptr &&
-            g.cu.writeValue32 != nullptr && g_vk.fill != nullptr)
+            g.cu.writeValue32 != nullptr && (g_vk.fill != nullptr || g_vk.native))
             feature->gpuWait = ensure_vram_buffer(*feature, feature->gpuMarker, 256) &&
                                g.worker.call([feature] { return g.cu.writeValue32(feature->gpuMarker.device, 0); }) == 0;
         feature->linearInputs = feature->gpuWait && env_uint("D4R_SHIM_LINEAR_INPUTS", 0) != 0 &&
@@ -4822,8 +4974,23 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         if (feature->linearInputs)
             logf("linear inputs: NGX samples the interop buffers directly");
         logf("VRAM interop %s for this feature%s%s", p.vram ? "on" : "off",
-             feature->split ? ", presenting each frame's own result (split frames)" : "",
+             feature->split ? (g_vk.native ? ", presenting each frame's own result (GPU-side wait in the game's "
+                                             "command list)"
+                                           : ", presenting each frame's own result (split frames)")
+                            : "",
              feature->gpuWait ? ", DLSS queued behind a GPU-side wait for the inputs" : "");
+    }
+    else if (feature->split && g_vk.native && feature->inlineTimeouts.load() >= 3)
+    {
+        logf("frame %u: the GPU-side waits for DLSS keep timing out (%d); showing the newest finished result from "
+             "now on (as FrameAge = 1)", frame, feature->inlineTimeouts.load());
+        drain_pipeline();
+        {
+            std::lock_guard<std::mutex> lock(feature->splitMutex);
+            feature->split = false;
+        }
+        feature->gpuWait = false;
+        feature->linearInputs = false;
     }
     else if (feature->vram && !p.vram)
     {
@@ -4894,6 +5061,19 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                        : !ensure_staging(outputSlot.staging, output, D3D12_HEAP_TYPE_UPLOAD))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
+        if (p.vram && feature->split && g_vk.native)
+        {
+            // the slots' earlier results are gone; nothing is queued (drained above)
+            if (!ensure_vram_buffer(*feature, feature->inlinePresent,
+                                    vram_output_pitch(static_cast<UINT>(outputDesc.Width)) * outputDesc.Height) ||
+                g.worker.call([feature] {
+                    int result = 0;
+                    for (int slot = 0; slot < d4r_inline::kSlots && result == 0; ++slot)
+                        result = g.cu.writeValue32(feature->inlineStatus.device + 4 * (d4r_inline::kProduced + slot), 0);
+                    return result;
+                }) != 0)
+                return NGX_FAIL_PLATFORM_ERROR;
+        }
     }
 
     const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
@@ -4951,14 +5131,17 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     }
     const auto outputRecordStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     if (p.vram && feature->split)
-        p.split = SUCCEEDED(g_vk.split->SplitCommandListForExternalWait(
-            list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
+        p.split = g_vk.native || SUCCEEDED(g_vk.split->SplitCommandListForExternalWait(
+                                     list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
     if (p.split)
     {
-        // Runs in the second half of the list, once frame's result is in place.
+        // Runs in the second half of the list (native Windows: after a GPU-side wait), once frame's result is in
+        // place.
         const int target = static_cast<int>(frame % kOutputSlots);
         transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
+        if (g_vk.native)
+            record_inline_output(list, *feature, vramOutput, frame);
+        else if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
             logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
         transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
         if (timing.enabled)

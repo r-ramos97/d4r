@@ -79,6 +79,9 @@ def build_binaries(out):
     run(flags + ["-shared", windows / "fake_optiscaler.c", "-lversion", "-o", out / "fake_optiscaler.dll"])
     run(flags + [windows / "preload_test.c", "-o", out / "preload_test.exe"])
     run(["bash", ROOT / "scripts" / "build_d3d12_native_interop_probe.sh"])
+    run([os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"), "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror",
+         "-Wno-missing-field-initializers", "-I", ROOT / "tools", "-static", "-static-libgcc", "-static-libstdc++",
+         windows / "inline_test.cpp", "-ld3d12", "-ldxgi", "-o", out / "inline_test.exe"])
     shutil.copy(ROOT / "build" / "windows" / "d4r-interop-probe.exe", out / "d4r-interop-probe.exe")
     if CLANG_CL:
         env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
@@ -183,7 +186,17 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         self.assertIn("D3D12 texture -> shared buffer -> CUDA: FAIL", output)
         self.assertIn("D3D12 fence as a HIP external semaphore: imported", output)
         self.assertIn("round trip D3D12 -> HIP -> D3D12: FAIL (no result within 10 s", output)
-        self.assertIn("RESULT: VRAM sharing FAILS (D3D12 resource), GPU sync: shared fence no, marker no", output)
+        self.assertIn("RESULT: VRAM sharing FAILS (D3D12 resource), GPU sync: shared fence no, marker no, "
+                      "same-frame wait no", output)
+        self.assertIn("Same-frame results do not work here", output)
+
+    def test_same_frame_wait_shaders(self):
+        """tools/d4r_d3d12_inline.h's wait and copy shaders, compiled by Windows' d3dcompiler_47 and run on WARP:
+        which output slot each case shows, the spin limit, and that the chosen slot's bytes are copied."""
+        result = self.run_program(self.binaries / "inline_test.exe")
+        if result.returncode == 3 and not ON_WINDOWS:
+            self.skipTest("this Wine has no D3D12 (vkd3d needs Vulkan)")
+        self.assert_all_pass(result)
 
     def test_shim_initialises_ngx_through_the_bridge(self):
         """A portable install on native Windows: OptiScaler loads d4r\\nvngx.dll, which reads d4r.ini and

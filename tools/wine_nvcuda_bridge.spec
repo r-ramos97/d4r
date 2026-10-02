@@ -100,6 +100,7 @@
 @ stdcall d4rEventSynchronize(ptr) d4rEventSynchronize
 @ stdcall d4rStreamWaitValue32(int64 long) d4rStreamWaitValue32
 @ stdcall d4rWriteValue32(int64 long) d4rWriteValue32
+@ stdcall d4rStreamWriteValue32(int64 long) d4rStreamWriteValue32
 @ stdcall d4rSetArrayRedirect(ptr int64 long) d4rSetArrayRedirect
 @ stdcall d4rRegisterLinearTexture(int64 int64 int64 long long) d4rRegisterLinearTexture
 @ stdcall d4rSetEnv(str str long) d4rSetEnv

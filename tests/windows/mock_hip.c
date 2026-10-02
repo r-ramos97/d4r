@@ -44,6 +44,23 @@ EXPORT int hipStreamWaitValue32(void* stream, void* pointer, unsigned value, uns
     return 0;
 }
 
+/* the device raw HIP calls run on, and the last null-stream write (d4rStreamWriteValue32) */
+static int current_device = 0;
+static void* written_pointer;
+static unsigned written_value;
+static void* written_stream = (void*)1;
+EXPORT int hipSetDevice(int device) { current_device = device; return 0; }
+EXPORT int hipStreamWriteValue32(void* stream, void* pointer, unsigned value, unsigned flags)
+{
+    (void)flags;
+    written_stream = stream, written_pointer = pointer, written_value = value;
+    return 0;
+}
+EXPORT void mock_hip_write(int* device, void** stream, void** pointer, unsigned* value)
+{
+    *device = current_device, *stream = written_stream, *pointer = written_pointer, *value = written_value;
+}
+
 /* what the interop calls received; field offsets as in hip_runtime_api.h on x86-64 */
 static struct
 {
