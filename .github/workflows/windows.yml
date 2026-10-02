@@ -6,6 +6,16 @@ name: Windows
 on:
   push:
     branches: [windows-native]
+    paths:
+      - .github/workflows/windows.yml
+      - kernels/**
+      - patches/zluda/**
+      - scripts/build_network_kernels.sh
+      - scripts/build_zluda_ptx_helpers.sh
+      - scripts/fetch_zluda_source.sh
+      - scripts/package_windows.sh
+      - tools/**
+      - packaging/windows/**
   workflow_dispatch:
 
 permissions:
@@ -29,7 +39,9 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/rocm.list
           printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends rocm-llvm rocm-device-libs hip-dev hipcc
+          sudo apt-get install -y --no-install-recommends rocm-llvm rocm-llvm-dev rocm-device-libs hip-dev hipcc
+          ls /opt/rocm/lib/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/llvm-as /opt/rocm/lib/llvm/bin/llvm-dis \
+            /opt/rocm/amdgcn/bitcode/ocml.bc /opt/rocm/bin/hipcc
       - name: ZLUDA source with patches/zluda
         run: scripts/fetch_zluda_source.sh zluda
       - name: Device helper bitcode (ptx/lib/*.bc)
