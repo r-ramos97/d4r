@@ -203,6 +203,22 @@ class WindowsNativeBridgeTests(unittest.TestCase):
                       "same-frame wait no", output)
         self.assertIn("Same-frame results do not work here", output)
 
+    def test_missing_hip_fails_cleanly(self):
+        """Without AMD's HIP runtime, ZLUDA's first HIP call would raise an exception that ends the process (a
+        game): the bridge fails cuInit instead, saying why, and d4r-interop-probe.exe ends on its RESULT line."""
+        folder = self.work / "no-hip"  # not beside the mock amdhip64_7.dll, which the search path would find
+        (folder / "hip" / "bin").mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.binaries / "d4r-interop-probe.exe", folder / "d4r-interop-probe.exe")
+        result = self.run_program(folder / "d4r-interop-probe.exe", windows_path(self.d4r / "nvcuda.dll"), "64", "32",
+                                  extra_env={"D4R_PROBE_ADAPTER": "warp", "HIP_PATH": windows_path(folder / "hip")})
+        output = result.stdout
+        if not ON_WINDOWS and "cuInit" not in output:
+            self.skipTest("this Wine has no D3D12 (vkd3d needs Vulkan): " + output.strip().splitlines()[-1])
+        self.assertEqual(result.returncode, 2, output + result.stderr[-3000:])
+        self.assertIn("cuInit through the bridge failed", output)
+        self.assertIn("AMD's HIP runtime (amdhip64_7.dll or amdhip64_6.dll) is not installed", output)
+        self.assertIn("RESULT: the check stopped early", output)
+
     def test_same_frame_wait_shaders(self):
         """tools/d4r_d3d12_inline.h's wait and copy shaders, compiled by Windows' d3dcompiler_47 and run on WARP:
         which output slot each case shows, the spin limit, and that the chosen slot's bytes are copied."""

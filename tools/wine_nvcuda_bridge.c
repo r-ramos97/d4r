@@ -864,6 +864,14 @@ static void load_zluda(void)
     else
         beside_bridge("zluda/zluda_nvcuda.dll", path, sizeof(path));
     preload_hip();
+    /* ZLUDA delay-loads HIP: without it ZLUDA's first HIP call raises an exception that ends the process (the
+       game), so a missing HIP fails cuInit here instead, and NGX reports DLSS as unavailable. */
+    if (LoadLibraryA("amdhip64_7.dll") == NULL && LoadLibraryA("amdhip64_6.dll") == NULL)
+    {
+        set_load_error("AMD's HIP runtime (amdhip64_7.dll or amdhip64_6.dll) is not installed: install a current AMD "
+                       "Adrenalin driver and the AMD HIP SDK for Windows (or set RocmDir in d4r.ini)");
+        return;
+    }
     cuda_library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (cuda_library == NULL)
     {
