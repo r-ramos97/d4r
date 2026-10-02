@@ -72,6 +72,9 @@ def build_binaries(out):
     run(flags + ["-shared", windows / "mock_ngx_core.c", "-o", out / "_nvngx.dll"])
     run(flags + [windows / "bridge_test.c", "-o", out / "bridge_test.exe"])
     run(flags + [windows / "shim_test.c", "-o", out / "shim_test.exe"])
+    run(flags + ["-std=gnu11", "-shared", "-static-libgcc", ROOT / "tools" / "d4r_nvapi_windows.c", "-o",
+                 out / "nvapi64.dll"])
+    run(flags + [windows / "nvapi_test.c", "-o", out / "nvapi_test.exe"])
     if CLANG_CL:
         env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
         run(["bash", ROOT / "scripts" / "build_d4r_nvngx_shim.sh"], env=env)
@@ -116,7 +119,7 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def run_program(self, *args, extra_env=None):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("D4R_", "HIP_PATH"))}
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("D4R_", "HIP_PATH"))}
         env["HIP_PATH"] = windows_path(self.work / "hip")
         env.update(extra_env or {})
         command = [str(arg) for arg in args]
@@ -140,6 +143,14 @@ class WindowsNativeBridgeTests(unittest.TestCase):
 
     def test_bridge_against_mock_zluda_and_hip(self):
         self.assert_all_pass(self.run_test_program())
+
+    def test_nvapi_identity(self):
+        """d4r's Windows nvapi64.dll: an Ada GPU for OptiScaler and NGX, and a log of what was asked for."""
+        folder = self.work / "nvapi"
+        folder.mkdir(exist_ok=True)
+        shutil.copy(self.binaries / "nvapi64.dll", folder / "nvapi64.dll")
+        self.assert_all_pass(self.run_program(self.binaries / "nvapi_test.exe", windows_path(folder / "nvapi64.dll"),
+                                              extra_env={"D4R_NVAPI_LUID": "1:abcd"}))
 
     def test_shim_initialises_ngx_through_the_bridge(self):
         """A portable install on native Windows: OptiScaler loads d4r\\nvngx.dll, which reads d4r.ini and
