@@ -82,6 +82,9 @@ def build_binaries(out):
     run([os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"), "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror",
          "-Wno-missing-field-initializers", "-I", ROOT / "tools", "-static", "-static-libgcc", "-static-libstdc++",
          windows / "inline_test.cpp", "-ld3d12", "-ldxgi", "-o", out / "inline_test.exe"])
+    run([os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"), "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror",
+         "-Wno-missing-field-initializers", "-I", ROOT / "tools", "-static", "-static-libgcc", "-static-libstdc++",
+         windows / "convert_test.cpp", "-ld3d12", "-ldxgi", "-o", out / "convert_test.exe"])
     shutil.copy(ROOT / "build" / "windows" / "d4r-interop-probe.exe", out / "d4r-interop-probe.exe")
     if CLANG_CL:
         env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
@@ -194,6 +197,14 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         """tools/d4r_d3d12_inline.h's wait and copy shaders, compiled by Windows' d3dcompiler_47 and run on WARP:
         which output slot each case shows, the spin limit, and that the chosen slot's bytes are copied."""
         result = self.run_program(self.binaries / "inline_test.exe")
+        if result.returncode == 3 and not ON_WINDOWS:
+            self.skipTest("this Wine has no D3D12 (vkd3d needs Vulkan)")
+        self.assert_all_pass(result)
+
+    def test_format_conversion_shaders(self):
+        """tools/d4r_d3d12_convert.h on WARP: each game format the VRAM path converts, into DLSS's canonical
+        layout and back out, against the host path's conversions."""
+        result = self.run_program(self.binaries / "convert_test.exe")
         if result.returncode == 3 and not ON_WINDOWS:
             self.skipTest("this Wine has no D3D12 (vkd3d needs Vulkan)")
         self.assert_all_pass(result)
