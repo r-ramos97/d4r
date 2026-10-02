@@ -4,9 +4,25 @@
 # usage: sh d4r/d4r-check.sh [GAME_FOLDER] [ROCM_DIR]
 GAME="${1:-.}"
 D4R="$GAME/d4r"
+# A d4r.ini setting as the shim reads it: the last "Key = value" (key in any case, inline ; or # comment and
+# CRLF removed); empty when it is unset or auto.
+ini_get() {
+  awk -v key="$1" '
+    { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line) }
+    line ~ /^[;#]/ || substr(line, 1, 1) == "[" { next }
+    { eq = index(line, "="); if (!eq) next
+      k = substr(line, 1, eq - 1); sub(/[ \t]+$/, "", k); if (tolower(k) != tolower(key)) next
+      v = substr(line, eq + 1); sub(/[ \t]+[;#].*$/, "", v); gsub(/^[ \t]+|[ \t]+$/, "", v); value = v }
+    END { if (tolower(value) != "auto") print value }' "$D4R/d4r.ini" 2>/dev/null
+}
+# 1 or 0 for a boolean setting, $2 when it is unset or not a boolean
+ini_flag() {
+  case "$(ini_get "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) echo 1 ;; 0|false|no|off) echo 0 ;; *) echo "$2" ;;
+  esac
+}
 # ROCm: the argument, else d4r.ini's RocmDir, else the bundled d4r/rocm, else D4R_ROCM_DIR, else /opt/rocm
-ini_rocm=$(sed -n 's/^[[:space:]]*RocmDir[[:space:]]*=[[:space:]]*\([^;#]*\).*/\1/p' "$D4R/d4r.ini" 2>/dev/null | tail -1 | sed 's/[[:space:]]*$//')
-[ "$ini_rocm" = auto ] && ini_rocm=
+ini_rocm=$(ini_get RocmDir)
 case "$ini_rocm" in "~/"*) ini_rocm="$HOME/${ini_rocm#\~/}" ;; esac
 [ -z "$ini_rocm" ] && [ -d "$D4R/rocm/lib" ] && ini_rocm="$D4R/rocm"
 ROCM="${2:-${ini_rocm:-${D4R_ROCM_DIR:-/opt/rocm}}}"
@@ -38,15 +54,55 @@ for dir in "$ROCM/lib" /opt/rocm/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-g
 done
 [ -n "$found" ] && ok "ROCm HIP runtime ($found/libamdhip64.so.7)" || bad "ROCm HIP runtime 7.x (libamdhip64.so.7); re-extract the d4r zip, which includes it in d4r/rocm"
 [ -e /dev/kfd ] && ok "/dev/kfd (ROCm compute device)" || bad "/dev/kfd: the amdgpu compute interface is not available"
-target=""
-for props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+# The GPU the bridge uses: D4R_GPU_ARCH, else the KFD GPU with the most SIMDs (a discrete GPU over an iGPU).
+# D4R_CHECK_KFD_NODES replaces the KFD topology directory (for tests).
+target=""; best=0; gpus=0
+for props in "${D4R_CHECK_KFD_NODES:-/sys/class/kfd/kfd/topology/nodes}"/*/properties; do
   s=$(sed -n 's/^simd_count //p' "$props" 2>/dev/null); t=$(sed -n 's/^gfx_target_version //p' "$props" 2>/dev/null)
-  [ -n "$s" ] && [ "$s" != 0 ] && [ -n "$t" ] && [ "$t" != 0 ] && { target="$t"; break; }
+  [ -n "$s" ] && [ "$s" != 0 ] && [ -n "$t" ] && [ "$t" != 0 ] || continue
+  gpus=$((gpus + 1))
+  [ "$s" -gt "$best" ] && { best="$s"; target="$t"; }
 done
-if [ -n "$target" ]; then
-  arch=$(printf 'gfx%d%d%x' $((target / 10000)) $(((target / 100) % 100)) $((target % 100)))
-  if [ -d "$D4R/kernels/$arch" ]; then ok "GPU $arch: native kernels present"
-  else note "GPU $arch: no native kernels for it in this release (DLSS runs, much slower)"; fi
+arch=""
+[ -n "$target" ] && arch=$(printf 'gfx%d%d%x' $((target / 10000)) $(((target / 100) % 100)) $((target % 100)))
+case "${D4R_GPU_ARCH:-}" in
+  gfx*) arch="$D4R_GPU_ARCH"; note "GPU $arch set by D4R_GPU_ARCH" ;;
+  *) [ "$gpus" -gt 1 ] && note "$gpus GPUs; d4r uses the one with the most SIMDs ($arch); D4R_GPU_ARCH overrides" ;;
+esac
+
+# The native kernel set the bridge serves for that GPU (tools/d4r_native_selection.h, release layout):
+# PreferAccuracy uses kernels/accuracy, NativeFp8 on RDNA4 the <target>-fp8 folder, else <target>.
+# The environment wins over d4r.ini, as in the shim.
+accuracy="${D4R_PREFER_ACCURACY:-$(ini_flag PreferAccuracy 0)}"
+fp8="${D4R_ZLUDA_WMMA_FP8_NATIVE:-$(ini_flag NativeFp8 1)}"
+accuracy_marker() {
+  [ "$(head -n 1 "$1/d4r-accuracy.txt" 2>/dev/null)" = 1 ] && [ "$(head -n 1 "$1/d4r-accuracy.txt" | wc -c)" -eq 2 ]
+}
+kernel_set() {
+  if [ "$accuracy" = 1 ]; then accuracy_marker "$1" || return 1; fi
+  [ -f "$1/d4r-kernels.txt" ] || [ "$accuracy" = 1 ]
+}
+kernel_dir() {
+  base="$D4R/kernels"
+  if [ "$accuracy" = 1 ] && ! accuracy_marker "$base"; then base="$base/accuracy"; fi
+  case "$fp8:$arch" in 1:gfx12*) kernel_set "$base/$arch-fp8" && { echo "$base/$arch-fp8"; return; } ;; esac
+  kernel_set "$base/$arch" && { echo "$base/$arch"; return; }
+  kernel_set "$base" && echo "$base"
+}
+case "$(ini_get NativeKernels | tr '[:upper:]' '[:lower:]')" in ""|on|true|1|fast) native=1 ;; *) native=0 ;; esac
+set_kind=""; [ "$accuracy" = 1 ] && set_kind="accuracy "
+if [ "$native" = 0 ]; then
+  note "NativeKernels = off: ZLUDA compiles every DLSS kernel from NVIDIA's code (much slower)"
+elif [ -n "$arch" ]; then
+  dir=$(kernel_dir)
+  if [ -n "$dir" ]; then
+    ok "GPU $arch: ${set_kind}native kernels in ${dir#"$GAME"/}"
+    case "$fp8:$arch:$dir" in 1:gfx12*:*-fp8) ;; 1:gfx12*) note "no FP8 variant for $arch; using its 16-bit kernels" ;; esac
+  elif [ "$accuracy" = 1 ]; then
+    note "GPU $arch: PreferAccuracy = true but no accuracy kernels for it here; ZLUDA compiles NVIDIA's code (much slower)"
+  else
+    note "GPU $arch: no native kernels for it in this release (DLSS runs, much slower)"
+  fi
 fi
 
 printf '\nSteam launch options for this game:\n  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %%command%%\n'
