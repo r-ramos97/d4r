@@ -190,9 +190,16 @@ struct Presenter
     void record(ID3D12GraphicsCommandList* list, ID3D12Resource* status, ID3D12Resource* const slots[kSlots],
                 ID3D12Resource* present, uint32_t frame, uint64_t bytes, uint32_t maxSpins) const
     {
+        // Every transition comes before the wait: buffers bound as root descriptors count as used by each dispatch
+        // that runs with them bound, the wait's included, so the debug layer would otherwise see them promoted
+        // implicitly there and reject a later COMMON -> SRV transition.
         D3D12_RESOURCE_BARRIER barriers[kSlots + 2] = {};
         int count = 0;
         barriers[count++] = transition(status, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        for (int slot = 0; slot < kSlots; ++slot)
+            barriers[count++] = transition(slots[slot], D3D12_RESOURCE_STATE_COMMON,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers[count++] = transition(present, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->ResourceBarrier(count, barriers);
 
         const uint32_t vectors = static_cast<uint32_t>(bytes / 16);
@@ -209,17 +216,12 @@ struct Presenter
         list->SetPipelineState(wait);
         list->Dispatch(1, 1, 1);
 
-        // The slots are read only now, after the wait: their transitions also drop stale cached data.
-        count = 0;
+        // The copy starts once the wait is over and its choice is stored; a barrier between the two dispatches also
+        // drops what the shader caches hold, so the slots are read as HIP left them.
         D3D12_RESOURCE_BARRIER uav = {};
         uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uav.UAV.pResource = status;
-        barriers[count++] = uav;
-        for (int slot = 0; slot < kSlots; ++slot)
-            barriers[count++] = transition(slots[slot], D3D12_RESOURCE_STATE_COMMON,
-                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers[count++] = transition(present, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(count, barriers);
+        uav.UAV.pResource = nullptr; // every UAV access
+        list->ResourceBarrier(1, &uav);
         list->SetPipelineState(copy);
         list->Dispatch(groupsX, groupsY, 1);
 

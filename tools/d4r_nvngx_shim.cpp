@@ -3960,13 +3960,15 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
                 logf("frame %u VRAM verify plane=%d: %zu of %zu bytes differ from host staging", frame, index,
                      differing, vram.size());
         }
+        // a row of the array; the buffer's rows may be longer (256-byte aligned for D3D12 on native Windows)
+        const size_t texelRowBytes = canonical_texel_bytes(planes[index]) * geometry.width;
         CudaMemcpy2D copy = {};
         copy.srcMemoryType = CUDA_MEMORY_DEVICE;
         copy.srcDevice = slot.vram[index].device;
         copy.srcPitch = geometry.rowBytes;
         copy.dstMemoryType = CUDA_MEMORY_ARRAY;
         copy.dstArray = images[index]->array;
-        copy.WidthInBytes = geometry.rowBytes;
+        copy.WidthInBytes = texelRowBytes;
         copy.Height = geometry.height;
         result = copy_2d(copy);
         // D4R_SHIM_VRAM_ARRAY_VERIFY=1: read the CUDA array DLSS samples back
@@ -3982,7 +3984,7 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
             readBuffer.dstMemoryType = CUDA_MEMORY_HOST;
             readBuffer.dstHost = fromBuffer.data();
             readBuffer.dstPitch = geometry.rowBytes;
-            readBuffer.WidthInBytes = geometry.rowBytes;
+            readBuffer.WidthInBytes = texelRowBytes;
             readBuffer.Height = geometry.height;
             CudaMemcpy2D readArray = {};
             readArray.srcMemoryType = CUDA_MEMORY_ARRAY;
@@ -3990,7 +3992,7 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
             readArray.dstMemoryType = CUDA_MEMORY_HOST;
             readArray.dstHost = fromArray.data();
             readArray.dstPitch = geometry.rowBytes;
-            readArray.WidthInBytes = geometry.rowBytes;
+            readArray.WidthInBytes = texelRowBytes;
             readArray.Height = geometry.height;
             if (g.cu.memcpy2D(&readBuffer) == 0 && g.cu.memcpy2D(&readArray) == 0)
             {

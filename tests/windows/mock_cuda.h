@@ -60,9 +60,10 @@ static inline MockArray* mock_array_new(size_t width, size_t height, unsigned in
     return array;
 }
 
-/* base and pitch of one side of a copy; 0 for an unknown memory type */
+/* base and pitch of one side of a copy; 0 for an unknown memory type or, as CUDA and HIP refuse it, a copy that
+   leaves an array (`width` bytes by `height` rows from x, y) */
 static inline unsigned char* mock_side(uint32_t type, const void* host, uint64_t device, void* array, size_t pitch,
-                                       size_t x, size_t y, size_t* row_pitch)
+                                       size_t x, size_t y, size_t width, size_t height, size_t* row_pitch)
 {
     if (type == 3 || type == 10) /* CUDA or HIP array */
     {
@@ -70,6 +71,8 @@ static inline unsigned char* mock_side(uint32_t type, const void* host, uint64_t
         if (mock == NULL || mock->magic != MOCK_ARRAY_MAGIC)
             return NULL;
         *row_pitch = mock->width * mock->element_bytes;
+        if (x + width > *row_pitch || y + height > mock->height)
+            return NULL;
         return mock->data + y * *row_pitch + x;
     }
     if (type == 1 || type == 2 || type == 4)
@@ -87,9 +90,11 @@ static inline int mock_copy_2d(const MockMemcpy2D* copy)
 {
     size_t src_pitch = 0, dst_pitch = 0;
     const unsigned char* src = mock_side(copy->srcMemoryType, copy->srcHost, copy->srcDevice, copy->srcArray,
-                                         copy->srcPitch, copy->srcXInBytes, copy->srcY, &src_pitch);
+                                         copy->srcPitch, copy->srcXInBytes, copy->srcY, copy->WidthInBytes,
+                                         copy->Height, &src_pitch);
     unsigned char* dst = mock_side(copy->dstMemoryType, copy->dstHost, copy->dstDevice, copy->dstArray,
-                                   copy->dstPitch, copy->dstXInBytes, copy->dstY, &dst_pitch);
+                                   copy->dstPitch, copy->dstXInBytes, copy->dstY, copy->WidthInBytes, copy->Height,
+                                   &dst_pitch);
     if (src == NULL || dst == NULL)
         return 1; /* invalid value */
     for (size_t row = 0; row < copy->Height; ++row)
