@@ -122,6 +122,7 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         command = [str(arg) for arg in args]
         if not ON_WINDOWS:
             env.setdefault("WINEPREFIX", str(Path.home() / ".cache" / "d4r-test-wineprefix"))
+            Path(env["WINEPREFIX"]).parent.mkdir(parents=True, exist_ok=True)  # Wine creates only the prefix
             env["WINEDEBUG"] = "-all"
             env["WINEDLLOVERRIDES"] = "mscoree,mshtml="
             command.insert(0, WINE)
