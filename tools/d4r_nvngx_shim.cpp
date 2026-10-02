@@ -2185,6 +2185,153 @@ static VulkanInterop g_vk;
 
 static bool create_vram_buffer(VramBuffer& target, size_t bytes);
 static void recycle_vram_buffer(VramBuffer& buffer);
+static void destroy_vram_buffer(VramBuffer& buffer);
+
+// Native Windows, game thread, once: whether D3D12 and HIP really see the same bytes of a shared buffer, both
+// ways, through the same kind of copies the frames use (on a direct queue of the game's device, and HIP copies on
+// the worker). A driver could import the handle yet map other memory; the game would then show black or stale
+// frames, so the VRAM path is taken only when the bytes cross. On failure `why` says what went wrong.
+static bool native_round_trip(const VramBuffer& probe, std::string& why)
+{
+    constexpr UINT64 kBytes = 4096;
+    std::vector<uint32_t> toHip(kBytes / 4), fromHip(kBytes / 4), seen(kBytes / 4);
+    for (size_t index = 0; index < toHip.size(); ++index)
+    {
+        toHip[index] = 0xd4a00000u ^ static_cast<uint32_t>(index * 2654435761u);
+        fromHip[index] = 0x5eed0000u ^ static_cast<uint32_t>(index * 40503u + 7u);
+    }
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    ID3D12Resource *upload = nullptr, *readback = nullptr;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    auto buffer = [](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, ID3D12Resource** resource) {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = type;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = kBytes;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                 __uuidof(ID3D12Resource), reinterpret_cast<void**>(resource));
+    };
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    HRESULT hr = event != nullptr ? S_OK : E_OUTOFMEMORY;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandQueue(&queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                              reinterpret_cast<void**>(&allocator));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                         __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&list));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
+    if (SUCCEEDED(hr))
+        hr = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &upload);
+    if (SUCCEEDED(hr))
+        hr = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, &readback);
+    void* mapped = nullptr;
+    if (SUCCEEDED(hr))
+        hr = upload->Map(0, nullptr, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        std::memcpy(mapped, toHip.data(), kBytes);
+        upload->Unmap(0, nullptr);
+    }
+    // the copies promote the shared buffer from COMMON implicitly; it decays back when the list completes
+    auto run = [&](ID3D12Resource* destination, ID3D12Resource* source, UINT64 value) {
+        HRESULT result = value == 1 ? S_OK : allocator->Reset();
+        if (SUCCEEDED(result) && value != 1)
+            result = list->Reset(allocator, nullptr);
+        if (FAILED(result))
+            return result;
+        list->CopyBufferRegion(destination, 0, source, 0, kBytes);
+        result = list->Close();
+        if (FAILED(result))
+            return result;
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        result = queue->Signal(fence, value);
+        if (SUCCEEDED(result))
+            result = fence->SetEventOnCompletion(value, event);
+        if (SUCCEEDED(result) && WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
+            result = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        return result;
+    };
+    char text[160] = "";
+    bool ok = false;
+    if (FAILED(hr))
+        std::snprintf(text, sizeof(text), "D3D12 setup failed (0x%08lx)", static_cast<unsigned long>(hr));
+    else if (FAILED(hr = run(probe.d3d12, upload, 1)))
+        std::snprintf(text, sizeof(text), "the D3D12 copy into the shared buffer failed (0x%08lx)",
+                      static_cast<unsigned long>(hr));
+    else
+    {
+        // D3D12 -> HIP, then HIP -> D3D12, with synchronous copies on the worker, which owns the context
+        const int copied = g.worker.call([&] {
+            CudaMemcpy2D copy = {};
+            copy.srcMemoryType = CUDA_MEMORY_DEVICE;
+            copy.srcDevice = probe.device;
+            copy.srcPitch = kBytes;
+            copy.dstMemoryType = CUDA_MEMORY_HOST;
+            copy.dstHost = seen.data();
+            copy.dstPitch = kBytes;
+            copy.WidthInBytes = kBytes;
+            copy.Height = 1;
+            int result = g.cu.memcpy2D(&copy);
+            if (result != 0)
+                return 100 + result;
+            if (std::memcmp(seen.data(), toHip.data(), kBytes) != 0)
+                return 1;
+            copy = {};
+            copy.srcMemoryType = CUDA_MEMORY_HOST;
+            copy.srcHost = fromHip.data();
+            copy.srcPitch = kBytes;
+            copy.dstMemoryType = CUDA_MEMORY_DEVICE;
+            copy.dstDevice = probe.device;
+            copy.dstPitch = kBytes;
+            copy.WidthInBytes = kBytes;
+            copy.Height = 1;
+            result = g.cu.memcpy2D(&copy);
+            if (result == 0)
+                result = g.cu.ctxSynchronize();
+            return result != 0 ? 100 + result : 0;
+        });
+        if (copied == 1)
+            std::snprintf(text, sizeof(text), "HIP does not see what D3D12 wrote into the shared buffer");
+        else if (copied != 0)
+            std::snprintf(text, sizeof(text), "a HIP copy of the shared buffer failed (%d)", copied - 100);
+        else if (FAILED(hr = run(readback, probe.d3d12, 2)))
+            std::snprintf(text, sizeof(text), "the D3D12 copy out of the shared buffer failed (0x%08lx)",
+                          static_cast<unsigned long>(hr));
+        else if (SUCCEEDED(readback->Map(0, nullptr, &mapped)))
+        {
+            ok = std::memcmp(mapped, fromHip.data(), kBytes) == 0;
+            const D3D12_RANGE none = {0, 0};
+            readback->Unmap(0, &none);
+            if (!ok)
+                std::snprintf(text, sizeof(text), "D3D12 does not see what HIP wrote into the shared buffer");
+        }
+        else
+            std::snprintf(text, sizeof(text), "mapping the readback buffer failed");
+    }
+    for (IUnknown* object : {static_cast<IUnknown*>(readback), static_cast<IUnknown*>(upload),
+                             static_cast<IUnknown*>(fence), static_cast<IUnknown*>(list),
+                             static_cast<IUnknown*>(allocator), static_cast<IUnknown*>(queue)})
+        if (object != nullptr)
+            object->Release();
+    if (event != nullptr)
+        CloseHandle(event);
+    why = text;
+    return ok;
+}
 
 // Native Windows, game thread, once: D3D12 shared buffers mapped into CUDA, if the bridge and HIP can.
 static void init_native_vram_interop()
@@ -2203,6 +2350,16 @@ static void init_native_vram_interop()
         g_vk.native = false;
         logf("VRAM interop: HIP cannot map a shared D3D12 buffer on this driver (d4r\\nvcuda.dll's log line above "
              "says why); inputs and the result go through host memory (docs/windows.md)");
+        return;
+    }
+    // D4R_SHIM_VRAM_CHECK=0 skips the round trip (the WARP tests' mock HIP shares nothing with D3D12)
+    std::string why;
+    if (env_uint("D4R_SHIM_VRAM_CHECK", 1) != 0 && !native_round_trip(probe, why))
+    {
+        destroy_vram_buffer(probe);
+        g_vk.native = false;
+        logf("VRAM interop: HIP maps shared D3D12 buffers on this driver, but the bytes do not cross (%s); inputs "
+             "and the result go through host memory (docs/windows.md)", why.c_str());
         return;
     }
     recycle_vram_buffer(probe); // pooled for the first feature

@@ -107,8 +107,10 @@ Where the inputs and the result go between the game and DLSS depends on the driv
   unordered access, which DLSS requires anyway). The shaders read and store through typed views in a descriptor
   heap of the shim's, which they bind on the game's command list as a DLSS evaluation may; Windows' CI runs
   every conversion on WARP against the host path's formulas (`tests/windows/convert_test.cpp`). Fully typed
-  sRGB colour cannot be viewed as UNORM and stays on the host path. At startup the shim maps one small buffer;
-  if HIP refuses it, it logs why and stays on host memory.
+  sRGB colour cannot be viewed as UNORM and stays on the host path. At startup the shim maps one small buffer
+  and sends bytes through it both ways (a D3D12 copy in, read by HIP; a HIP copy in, read by a D3D12 copy), on
+  a queue of the game's device; if HIP refuses the buffer or the bytes do not cross, it logs why and stays on
+  host memory, so a driver that maps the handle to other memory costs speed, not a black image.
 - **Host memory** otherwise: readback buffers in, an upload buffer out; about 55 MB per frame cross PCIe at
   1440p Quality.
 

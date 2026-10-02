@@ -223,8 +223,9 @@ class WindowsNativeBridgeTests(unittest.TestCase):
     def test_harness_end_to_end_on_warp(self):
         """The D3D12 harness drives the shim as a game does, on WARP (with the D3D12 debug layer when Windows has
         it), through the bridge to the mock NGX core, ZLUDA and HIP: the host path (whose output the mock NGX's
-        nearest-neighbour upscale reaches), the D3D12 VRAM path, its format conversion shaders and the same-frame
-        wait. Every D3D12 call the shim records runs on Microsoft's runtime."""
+        nearest-neighbour upscale reaches), the startup round trip that keeps the shim off a VRAM path whose bytes
+        do not cross, the D3D12 VRAM path, its format conversion shaders and the same-frame wait. Every D3D12 call
+        the shim records runs on Microsoft's runtime."""
         if not (self.binaries / "d4r-harness.exe").exists():
             self.skipTest("the shim build needs clang-cl")
         game = self.work / "harness-game"
@@ -243,17 +244,23 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         shutil.copy(self.binaries / "d4r-harness.exe", game / "d4r-harness.exe")
         base = {"D4R_PLATFORM": "windows", "D4R_HARNESS_ADAPTER": "warp", "D4R_HARNESS_D3D12_DEBUG": "1",
                 "D4R_HARNESS_FRAME_WAIT_MS": "100", "D4R_SHIM_INLINE_SPINS": "20000"}
+        # the mock HIP's "device" memory is host memory that D3D12 never sees: the VRAM scenarios skip the shim's
+        # round-trip check (D4R_SHIM_VRAM_CHECK=0), which must otherwise catch exactly that
+        vram = {"D4R_SHIM_VRAM_CHECK": "0"}
+        same_frame = dict(vram, D4R_SHIM_SPLIT_FRAME="1", D4R_SHIM_MAX_IN_FLIGHT="3")
         scenarios = [
             ("host path", {"D4R_SHIM_VRAM_INTEROP": "0"}, ["VRAM interop off for this feature"], True),
             ("host path, RGBA8", {"D4R_SHIM_VRAM_INTEROP": "0", "D4R_HARNESS_RGBA8": "1"},
              ["VRAM interop off for this feature"], True),
-            ("VRAM interop", {}, ["VRAM interop: ready (native Windows", "VRAM interop on for this feature"], False),
-            ("VRAM interop, RGBA8 (conversion shaders)", {"D4R_HARNESS_RGBA8": "1"},
+            ("VRAM interop's round-trip check (the mocks share nothing)", {},
+             ["but the bytes do not cross (HIP does not see what D3D12 wrote into the shared buffer)",
+              "VRAM interop off for this feature"], True),
+            ("VRAM interop", vram, ["VRAM interop: ready (native Windows", "VRAM interop on for this feature"], False),
+            ("VRAM interop, RGBA8 (conversion shaders)", dict(vram, D4R_HARNESS_RGBA8="1"),
              ["converting colour, output on the GPU", "VRAM interop on for this feature"], False),
-            ("same-frame results", {"D4R_SHIM_SPLIT_FRAME": "1", "D4R_SHIM_MAX_IN_FLIGHT": "3"},
-             ["GPU-side wait in the game's command list"], False),
+            ("same-frame results", same_frame, ["GPU-side wait in the game's command list"], False),
             ("same-frame results, RGBA8 (the present buffer through the output conversion)",
-             {"D4R_SHIM_SPLIT_FRAME": "1", "D4R_SHIM_MAX_IN_FLIGHT": "3", "D4R_HARNESS_RGBA8": "1"},
+             dict(same_frame, D4R_HARNESS_RGBA8="1"),
              ["converting colour, output on the GPU", "GPU-side wait in the game's command list"], False),
         ]
         for name, extra, lines, data in scenarios:
