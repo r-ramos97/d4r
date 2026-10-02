@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "d4r_bridge_platform.h"
+#include "d4r_fatbin.h"
 #ifdef D4R_NATIVE_WINDOWS
 #include "d4r_hip_props.h"
 #endif
@@ -652,90 +653,14 @@ static void prepare_native_kernels(const char* cache_home)
            native_kernel_count, native_source, native_served);
 }
 
-/* LZ4 block decoder for compressed fatbin entries; returns the decoded size, 0 on bad input. */
-static size_t lz4_block(const unsigned char* src, size_t src_size, unsigned char* dst, size_t dst_size)
-{
-    size_t i = 0, o = 0;
-    while (i < src_size)
-    {
-        const unsigned int token = src[i++];
-        size_t literals = token >> 4;
-        if (literals == 15)
-        {
-            unsigned char b;
-            do
-            {
-                if (i >= src_size)
-                    return 0;
-                b = src[i++];
-                literals += b;
-            } while (b == 255);
-        }
-        if (literals > src_size - i || literals > dst_size - o)
-            return 0;
-        memcpy(dst + o, src + i, literals);
-        i += literals;
-        o += literals;
-        if (i >= src_size || o >= dst_size)
-            break;
-        if (src_size - i < 2)
-            return 0;
-        const size_t offset = src[i] | ((size_t)src[i + 1] << 8);
-        i += 2;
-        if (offset == 0 || offset > o)
-            return 0;
-        size_t match = token & 15;
-        if (match == 15)
-        {
-            unsigned char b;
-            do
-            {
-                if (i >= src_size)
-                    return 0;
-                b = src[i++];
-                match += b;
-            } while (b == 255);
-        }
-        match += 4;
-        if (match > dst_size - o)
-            match = dst_size - o;
-        for (size_t k = 0; k < match; ++k, ++o)
-            dst[o] = dst[o - offset];
-    }
-    return o;
-}
-
-static int is_ptx_name_char(unsigned char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$';
-}
-
 /* Links the native kernel of every .entry of one PTX module whose text matches the manifest. */
-static void verify_ptx_module(const unsigned char* text, size_t size)
+static void verify_ptx_module(const unsigned char* text, size_t size, void* context)
 {
-    while (size > 0 && text[size - 1] == '\0')
-        --size;
-    uint64_t hash = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < size; ++i)
-        hash = (hash ^ text[i]) * 0x100000001b3ull;
-    for (size_t i = 0; i + 7 < size; ++i)
+    (void)context;
+    const uint64_t hash = d4r_ptx_hash(text, &size);
+    char name[sizeof(native_kernels[0].name)];
+    for (size_t position = 0; d4r_next_ptx_entry(text, size, &position, name, sizeof(name));)
     {
-        if (memcmp(text + i, ".entry", 6) != 0 || (text[i + 6] != ' ' && text[i + 6] != '\t' && text[i + 6] != '\n'))
-            continue;
-        size_t p = i + 6;
-        while (p < size && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r'))
-            ++p;
-        const size_t start = p;
-        while (p < size && is_ptx_name_char(text[p]))
-            ++p;
-        const size_t length = p - start;
-        while (p < size && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r'))
-            ++p;
-        if (length == 0 || length >= sizeof(native_kernels[0].name) || p >= size || text[p] != '(')
-            continue;
-        char name[128];
-        memcpy(name, text + start, length);
-        name[length] = '\0';
         int known = 0, matched = 0;
         uint64_t expected = 0;
         for (size_t k = 0; k < native_kernel_count; ++k)
@@ -761,7 +686,6 @@ static void verify_ptx_module(const unsigned char* text, size_t size)
         if (known && !matched)
             tracef("native kernel %s not used: this DLSS's PTX for it differs (%016llx, expected %016llx)", name,
                    (unsigned long long)hash, (unsigned long long)expected);
-        i = p;
     }
 }
 
@@ -773,54 +697,15 @@ static void verify_native_kernels(const void* image)
     uint32_t magic = 0;
     memcpy(&magic, bytes, sizeof(magic));
     pthread_mutex_lock(&native_lock);
-    if (magic != 0xba55ed50u)
+    if (magic != D4R_FATBIN_MAGIC)
     {
         /* a PTX text image */
         const unsigned char* end = (const unsigned char*)memchr(bytes, 0, 64u * 1024u * 1024u);
         if (end != NULL)
-            verify_ptx_module(bytes, (size_t)(end - bytes));
-        pthread_mutex_unlock(&native_lock);
-        return;
+            verify_ptx_module(bytes, (size_t)(end - bytes), NULL);
     }
-    uint16_t version = 0, header_size = 0;
-    uint64_t files_size = 0;
-    memcpy(&version, bytes + 4, sizeof(version));
-    memcpy(&header_size, bytes + 6, sizeof(header_size));
-    memcpy(&files_size, bytes + 8, sizeof(files_size));
-    if (version == 1 && header_size >= 16 && header_size <= 4096 && files_size <= 256u * 1024u * 1024u)
-    {
-        size_t offset = header_size;
-        const size_t end = (size_t)header_size + (size_t)files_size;
-        while (offset + 64 <= end)
-        {
-            uint16_t kind = 0;
-            uint32_t entry_header = 0;
-            uint64_t entry_size = 0, flags = 0, decompressed = 0;
-            memcpy(&kind, bytes + offset, sizeof(kind));
-            memcpy(&entry_header, bytes + offset + 4, sizeof(entry_header));
-            memcpy(&entry_size, bytes + offset + 8, sizeof(entry_size));
-            memcpy(&flags, bytes + offset + 40, sizeof(flags));
-            if (entry_header >= 64)
-                memcpy(&decompressed, bytes + offset + 56, sizeof(decompressed));
-            if (entry_header < 16 || entry_size > end - offset - entry_header)
-                break;
-            const unsigned char* payload = bytes + offset + entry_header;
-            if (kind == 1) /* PTX */
-            {
-                if ((flags & 0x2000) != 0 && decompressed != 0 && decompressed <= 256u * 1024u * 1024u)
-                {
-                    unsigned char* text = (unsigned char*)malloc((size_t)decompressed);
-                    const size_t size = text != NULL ? lz4_block(payload, (size_t)entry_size, text, (size_t)decompressed) : 0;
-                    if (size != 0)
-                        verify_ptx_module(text, size);
-                    free(text);
-                }
-                else
-                    verify_ptx_module(payload, (size_t)entry_size);
-            }
-            offset += entry_header + entry_size;
-        }
-    }
+    else
+        d4r_fatbin_ptx(bytes, SIZE_MAX, verify_ptx_module, NULL);
     pthread_mutex_unlock(&native_lock);
 }
 
