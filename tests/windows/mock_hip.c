@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "d4r_hip_props.h"
+#include "mock_cuda.h"
 
 #define EXPORT __declspec(dllexport)
 
@@ -54,8 +55,25 @@ EXPORT int hipStreamWriteValue32(void* stream, void* pointer, unsigned value, un
 {
     (void)flags;
     written_stream = stream, written_pointer = pointer, written_value = value;
+    if ((uintptr_t)pointer >= 0x10000) /* real (host) memory, not a test's made-up address */
+        *(volatile unsigned*)pointer = value;
     return 0;
 }
+/* what the bridge's d4r helpers use beyond the interop calls: 2D copies (device memory and arrays on the null
+   stream, d4rMemcpy2DAsync), and a stream for d4rWriteValue32 */
+EXPORT int hipMemcpyParam2DAsync(const MockMemcpy2D* copy, void* stream)
+{
+    (void)stream;
+    return mock_copy_2d(copy);
+}
+EXPORT int hipStreamCreateWithFlags(void** stream, unsigned flags)
+{
+    (void)flags;
+    *stream = (void*)(uintptr_t)0x7001;
+    return 0;
+}
+EXPORT int hipStreamSynchronize(void* stream) { (void)stream; return 0; }
+
 EXPORT void mock_hip_write(int* device, void** stream, void** pointer, unsigned* value)
 {
     *device = current_device, *stream = written_stream, *pointer = written_pointer, *value = written_value;

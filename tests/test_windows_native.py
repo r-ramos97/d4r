@@ -69,7 +69,8 @@ def build_binaries(out):
     flags = [CC, "-O2", "-Wall", "-Wextra", "-Werror", "-I", ROOT / "tools"]
     run(flags + ["-shared", windows / "mock_zluda.c", "-o", out / "zluda_nvcuda.dll"])
     run(flags + ["-shared", windows / "mock_hip.c", "-o", out / "amdhip64_7.dll"])
-    run(flags + ["-shared", windows / "mock_ngx_core.c", "-o", out / "_nvngx.dll"])
+    if not CLANG_CL:
+        run(flags + ["-shared", windows / "mock_ngx_core.c", "-o", out / "_nvngx.dll"])
     run(flags + [windows / "bridge_test.c", "-o", out / "bridge_test.exe"])
     run(flags + [windows / "shim_test.c", "-o", out / "shim_test.exe"])
     run(["bash", ROOT / "scripts" / "build_windows_tools.sh"])
@@ -87,9 +88,18 @@ def build_binaries(out):
          windows / "convert_test.cpp", "-ld3d12", "-ldxgi", "-o", out / "convert_test.exe"])
     shutil.copy(ROOT / "build" / "windows" / "d4r-interop-probe.exe", out / "d4r-interop-probe.exe")
     if CLANG_CL:
-        env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
-        run(["bash", ROOT / "scripts" / "build_d4r_nvngx_shim.sh"], env=env)
+        cxx = os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++")
+        env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=cxx)
+        # the shim, and the D3D12 harness that drives it as a game does
+        run(["bash", ROOT / "scripts" / "build_d3d12_dlss_harness.sh"], env=env)
         shutil.copy(ROOT / "build" / "d4r_nvngx.dll", out / "d4r_nvngx.dll")
+        shutil.copy(ROOT / "build" / "d3d12_dlss_harness.exe", out / "d4r-harness.exe")
+        # the mock NGX core with real parameter objects (the shim's MSVC-ABI implementation)
+        run(flags + ["-DMOCK_NGX_PARAMETERS", "-c", windows / "mock_ngx_core.c", "-o", out / "mock_ngx_core.o"])
+        run([cxx, "-shared", out / "mock_ngx_core.o", ROOT / "tools" / "d4r_ngx_param_host.cpp",
+             ROOT / "build" / "d4r_ngx_param_msvc.obj", "-static", "-static-libgcc", "-static-libstdc++",
+             "-o", out / "_nvngx.dll"])
+        (out / "mock_ngx_core.o").unlink()
 
 
 @unittest.skipUnless((PREBUILT or shutil.which(CC)) and (ON_WINDOWS or WINE),
@@ -208,6 +218,57 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         if result.returncode == 3 and not ON_WINDOWS:
             self.skipTest("this Wine has no D3D12 (vkd3d needs Vulkan)")
         self.assert_all_pass(result)
+
+    @unittest.skipUnless(ON_WINDOWS, "needs Windows' D3D12 (Wine's vkd3d lacks WriteBufferImmediate and cs_5_1)")
+    def test_harness_end_to_end_on_warp(self):
+        """The D3D12 harness drives the shim as a game does, on WARP (with the D3D12 debug layer when Windows has
+        it), through the bridge to the mock NGX core, ZLUDA and HIP: the host path (whose output the mock NGX's
+        nearest-neighbour upscale reaches), the D3D12 VRAM path, its format conversion shaders and the same-frame
+        wait. Every D3D12 call the shim records runs on Microsoft's runtime."""
+        if not (self.binaries / "d4r-harness.exe").exists():
+            self.skipTest("the shim build needs clang-cl")
+        game = self.work / "harness-game"
+        if game.exists():
+            shutil.rmtree(game)
+        d4r = game / "d4r"
+        (d4r / "zluda").mkdir(parents=True)
+        (d4r / "ngx").mkdir()
+        shutil.copy(self.binaries / "d4r_nvngx.dll", d4r / "nvngx.dll")
+        shutil.copy(self.binaries / "nvcuda.dll", d4r / "nvcuda.dll")
+        shutil.copy(self.binaries / "zluda_nvcuda.dll", d4r / "zluda" / "zluda_nvcuda.dll")
+        shutil.copy(self.binaries / "_nvngx.dll", d4r / "ngx" / "_nvngx.dll")
+        shutil.copy(ROOT / "packaging" / "windows" / "d4r.ini", d4r / "d4r.ini")
+        (d4r / "nvngx_dlss.dll").write_bytes(b"placeholder")
+        shutil.copy(self.binaries / "nvapi64.dll", game / "nvapi64.dll")
+        shutil.copy(self.binaries / "d4r-harness.exe", game / "d4r-harness.exe")
+        base = {"D4R_PLATFORM": "windows", "D4R_HARNESS_ADAPTER": "warp", "D4R_HARNESS_D3D12_DEBUG": "1",
+                "D4R_HARNESS_FRAME_WAIT_MS": "100", "D4R_SHIM_INLINE_SPINS": "20000"}
+        scenarios = [
+            ("host path", {"D4R_SHIM_VRAM_INTEROP": "0"}, ["VRAM interop off for this feature"], True),
+            ("host path, RGBA8", {"D4R_SHIM_VRAM_INTEROP": "0", "D4R_HARNESS_RGBA8": "1"},
+             ["VRAM interop off for this feature"], True),
+            ("VRAM interop", {}, ["VRAM interop: ready (native Windows", "VRAM interop on for this feature"], False),
+            ("VRAM interop, RGBA8 (conversion shaders)", {"D4R_HARNESS_RGBA8": "1"},
+             ["converting colour, output on the GPU", "VRAM interop on for this feature"], False),
+            ("same-frame results", {"D4R_SHIM_SPLIT_FRAME": "1", "D4R_SHIM_MAX_IN_FLIGHT": "3"},
+             ["GPU-side wait in the game's command list"], False),
+        ]
+        for name, extra, lines, data in scenarios:
+            with self.subTest(name):
+                env = dict(base, **extra)
+                result = self.run_program(game / "d4r-harness.exe", windows_path(d4r / "nvngx.dll"),
+                                          windows_path(game / "out.raw"), "4", "64", "32", "128", "64",
+                                          extra_env=env)
+                log = (d4r / "d4r_nvngx.log").read_text(errors="replace") if (d4r / "d4r_nvngx.log").exists() else ""
+                context = f"{name}\n--- harness\n{result.stdout}\n{result.stderr[-3000:]}\n--- log\n{log[-6000:]}"
+                self.assertEqual(result.returncode, 0, context)
+                self.assertIn("CreateFeature -> 0x00000001", result.stdout, context)
+                for line in lines:
+                    self.assertIn(line, log, context)
+                self.assertNotIn("D3D12 debug error", result.stdout, context)
+                if data:
+                    # the mock NGX's upscale of the synthetic scene reached the game's output texture
+                    self.assertRegex(result.stdout, r"output read back: [1-9][0-9]* of", context)
 
     def test_shim_initialises_ngx_through_the_bridge(self):
         """A portable install on native Windows: OptiScaler loads d4r\\nvngx.dll, which reads d4r.ini and

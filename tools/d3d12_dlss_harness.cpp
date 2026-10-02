@@ -9,6 +9,8 @@
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
+#include <dxgi1_4.h>
 
 #include <algorithm>
 #include <array>
@@ -45,6 +47,33 @@ using PFN_Release = NgxResult (*)(NgxHandle*);
 using PFN_Shutdown = NgxResult (*)();
 
 static ID3D12Device* g_device;
+static ID3D12InfoQueue* g_infoQueue; // D4R_HARNESS_D3D12_DEBUG=1
+
+// The D3D12 debug layer's errors so far, printed; their number.
+static int report_d3d12_errors()
+{
+    if (g_infoQueue == nullptr)
+        return 0;
+    int errors = 0;
+    const UINT64 count = g_infoQueue->GetNumStoredMessages();
+    for (UINT64 index = 0; index < count; ++index)
+    {
+        SIZE_T length = 0;
+        g_infoQueue->GetMessage(index, nullptr, &length);
+        std::vector<uint8_t> storage(length);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(g_infoQueue->GetMessage(index, message, &length)))
+            continue;
+        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+        {
+            ++errors;
+            std::printf("D3D12 debug error: %.*s\n", static_cast<int>(message->DescriptionByteLength),
+                        message->pDescription);
+        }
+    }
+    g_infoQueue->ClearStoredMessages();
+    return errors;
+}
 static ID3D12CommandQueue* g_queue;
 static ID3D12CommandAllocator* g_allocator;
 static ID3D12GraphicsCommandList* g_list;
@@ -498,10 +527,42 @@ int main(int argc, char** argv)
     HMODULE d3d12 = LoadLibraryA("d3d12.dll");
     auto createDevice = reinterpret_cast<HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**)>(
         reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")));
+    // D4R_HARNESS_D3D12_DEBUG=1: the D3D12 debug layer, whose errors fail the run (exit code 4)
+    const bool debugLayer = std::getenv("D4R_HARNESS_D3D12_DEBUG") != nullptr;
+    if (debugLayer)
+    {
+        auto getDebug = reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12GetDebugInterface")));
+        ID3D12Debug* debug = nullptr;
+        if (getDebug != nullptr && SUCCEEDED(getDebug(__uuidof(ID3D12Debug), reinterpret_cast<void**>(&debug))))
+        {
+            debug->EnableDebugLayer();
+            debug->Release();
+            std::printf("D3D12 debug layer enabled\n");
+        }
+        else
+            std::printf("D3D12 debug layer unavailable (Graphics Tools not installed)\n");
+    }
+    // D4R_HARNESS_ADAPTER=warp: Windows' software renderer (tests on machines without a GPU)
+    IDXGIAdapter* adapter = nullptr;
+    if (const char* choice = std::getenv("D4R_HARNESS_ADAPTER"); choice != nullptr && std::strcmp(choice, "warp") == 0)
+    {
+        HMODULE dxgi = LoadLibraryA("dxgi.dll");
+        auto createFactory = reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+        IDXGIFactory4* factory = nullptr;
+        if (createFactory == nullptr ||
+            !check(createFactory(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)), "CreateDXGIFactory1") ||
+            !check(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&adapter)), "EnumWarpAdapter"))
+            return 1;
+        factory->Release();
+    }
     if (createDevice == nullptr ||
-        !check(createDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&g_device)),
+        !check(createDevice(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&g_device)),
                "D3D12CreateDevice"))
         return 1;
+    if (debugLayer && SUCCEEDED(g_device->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void**>(&g_infoQueue))))
+        g_infoQueue->SetMuteDebugOutput(TRUE);
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(g_device->CreateCommandQueue(&queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&g_queue)),
@@ -985,5 +1046,8 @@ int main(int argc, char** argv)
 
     release(feature);
     shutdown();
-    return 0;
+    const int errors = report_d3d12_errors();
+    if (g_infoQueue != nullptr)
+        std::printf("D3D12 debug layer: %d error(s)\n", errors);
+    return errors != 0 ? 4 : 0;
 }

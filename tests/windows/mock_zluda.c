@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mock_cuda.h"
 
 #define EXPORT __declspec(dllexport)
 typedef int CUresult;
@@ -110,6 +111,192 @@ EXPORT CUresult cuDeviceGetName(char* name, int length, int device)
     snprintf(name, (size_t)length, "mock ZLUDA device %d", device);
     return 0;
 }
+/* arrays, texture and surface objects, 2D copies, host memory, streams and events, for the shim's evaluation
+   path (tests/test_windows_native.py's harness test) */
+EXPORT CUresult cuArrayCreate_v2(void** array, const size_t* descriptor) /* {Width, Height, Format, NumChannels} */
+{
+    unsigned int format, channels;
+    memcpy(&format, descriptor + 2, 4);
+    memcpy(&channels, (const char*)(descriptor + 2) + 4, 4);
+    *array = mock_array_new(descriptor[0], descriptor[1], format, channels);
+    return 0;
+}
+EXPORT CUresult cuArray3DCreate_v2(void** array, const size_t* descriptor) /* {Width, Height, Depth, Format, ...} */
+{
+    unsigned int format, channels;
+    memcpy(&format, descriptor + 3, 4);
+    memcpy(&channels, (const char*)(descriptor + 3) + 4, 4);
+    *array = mock_array_new(descriptor[0], descriptor[1], format, channels);
+    return 0;
+}
+EXPORT CUresult cuArrayDestroy(void* array)
+{
+    MockArray* mock = (MockArray*)array;
+    if (mock == NULL || mock->magic != MOCK_ARRAY_MAGIC)
+        return 1;
+    mock->magic = 0;
+    free(mock->data);
+    free(mock);
+    return 0;
+}
+EXPORT CUresult cuArrayGetDescriptor_v2(size_t* descriptor, void* array)
+{
+    const MockArray* mock = (const MockArray*)array;
+    if (mock == NULL || mock->magic != MOCK_ARRAY_MAGIC)
+        return 1;
+    descriptor[0] = mock->width, descriptor[1] = mock->height;
+    memcpy(descriptor + 2, &mock->format, 4);
+    memcpy((char*)(descriptor + 2) + 4, &mock->channels, 4);
+    return 0;
+}
+EXPORT CUresult cuMemcpy2D_v2(const MockMemcpy2D* copy) { return mock_copy_2d(copy); }
+
+/* texture and surface objects: their resource descriptors (CUDA_RESOURCE_DESC, 144 bytes), by handle */
+enum { MAX_OBJECTS = 256 };
+static unsigned char objects[MAX_OBJECTS][144];
+static int object_used[MAX_OBJECTS];
+static CRITICAL_SECTION object_lock;
+static INIT_ONCE object_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_objects(PINIT_ONCE once, PVOID parameter, PVOID* context)
+{
+    (void)once, (void)parameter, (void)context;
+    InitializeCriticalSection(&object_lock);
+    return TRUE;
+}
+static CUresult object_create(uint64_t* object, const void* resource)
+{
+    InitOnceExecuteOnce(&object_once, init_objects, NULL, NULL);
+    EnterCriticalSection(&object_lock);
+    for (int index = 0; index < MAX_OBJECTS; ++index)
+        if (!object_used[index])
+        {
+            object_used[index] = 1;
+            memcpy(objects[index], resource, sizeof(objects[index]));
+            LeaveCriticalSection(&object_lock);
+            *object = (uint64_t)index + 1;
+            return 0;
+        }
+    LeaveCriticalSection(&object_lock);
+    return 2; /* out of memory */
+}
+static CUresult object_destroy(uint64_t object)
+{
+    if (object == 0 || object > MAX_OBJECTS)
+        return 1;
+    InitOnceExecuteOnce(&object_once, init_objects, NULL, NULL);
+    EnterCriticalSection(&object_lock);
+    object_used[object - 1] = 0;
+    LeaveCriticalSection(&object_lock);
+    return 0;
+}
+EXPORT CUresult cuTexObjectCreate(uint64_t* object, const void* resource, const void* texture, const void* view)
+{
+    (void)texture, (void)view;
+    return object_create(object, resource);
+}
+EXPORT CUresult cuTexObjectDestroy(uint64_t object) { return object_destroy(object); }
+EXPORT CUresult cuSurfObjectCreate(uint64_t* object, const void* resource) { return object_create(object, resource); }
+EXPORT CUresult cuSurfObjectDestroy(uint64_t object) { return object_destroy(object); }
+EXPORT CUresult cuTexObjectGetResourceDesc(void* resource, uint64_t object)
+{
+    if (object == 0 || object > MAX_OBJECTS || !object_used[object - 1])
+        return 1;
+    memcpy(resource, objects[object - 1], 144);
+    return 0;
+}
+EXPORT CUresult cuSurfObjectGetResourceDesc(void* resource, uint64_t object)
+{
+    return cuTexObjectGetResourceDesc(resource, object);
+}
+/* for the mock NGX core: an object's array, or its pitch-linear memory (data, width, height, pitch) */
+EXPORT int mock_zluda_object(uint64_t object, unsigned char** data, size_t* width, size_t* height, size_t* pitch,
+                             unsigned int* element_bytes)
+{
+    if (object == 0 || object > MAX_OBJECTS || !object_used[object - 1])
+        return 0;
+    const unsigned char* resource = objects[object - 1];
+    uint32_t type;
+    memcpy(&type, resource, 4);
+    if (type == 0) /* array */
+    {
+        MockArray* array;
+        memcpy(&array, resource + 8, sizeof(array));
+        if (array == NULL || array->magic != MOCK_ARRAY_MAGIC)
+            return 0;
+        *data = array->data, *width = array->width, *height = array->height;
+        *pitch = array->width * array->element_bytes, *element_bytes = array->element_bytes;
+        return 1;
+    }
+    if (type == 3) /* pitch 2D: {devPtr, format, numChannels, width, height, pitchInBytes} */
+    {
+        uint64_t pointer;
+        unsigned int format, channels;
+        memcpy(&pointer, resource + 8, 8);
+        memcpy(&format, resource + 16, 4);
+        memcpy(&channels, resource + 20, 4);
+        memcpy(width, resource + 24, 8);
+        memcpy(height, resource + 32, 8);
+        memcpy(pitch, resource + 40, 8);
+        *data = (unsigned char*)(uintptr_t)pointer;
+        *element_bytes = mock_format_bytes(format) * channels;
+        return 1;
+    }
+    return 0;
+}
+
+EXPORT CUresult cuMemHostAlloc(void** pointer, size_t bytes, unsigned int flags)
+{
+    (void)flags;
+    *pointer = calloc(1, bytes);
+    return *pointer != NULL ? 0 : 2;
+}
+EXPORT CUresult cuMemFreeHost(void* pointer) { free(pointer); return 0; }
+EXPORT CUresult cuMemcpyHtoDAsync_v2(uint64_t device, const void* host, size_t bytes, void* stream)
+{
+    (void)stream;
+    memcpy((void*)(uintptr_t)device, host, bytes);
+    return 0;
+}
+EXPORT CUresult cuMemcpyDtoHAsync_v2(void* host, uint64_t device, size_t bytes, void* stream)
+{
+    (void)stream;
+    memcpy(host, (const void*)(uintptr_t)device, bytes);
+    return 0;
+}
+EXPORT CUresult cuMemcpyDtoDAsync_v2(uint64_t destination, uint64_t source, size_t bytes, void* stream)
+{
+    (void)stream;
+    memmove((void*)(uintptr_t)destination, (const void*)(uintptr_t)source, bytes);
+    return 0;
+}
+static int streams;
+EXPORT CUresult cuStreamCreate(void** stream, unsigned int flags)
+{
+    (void)flags;
+    *stream = (void*)(uintptr_t)(0x5000 + ++streams);
+    return 0;
+}
+EXPORT CUresult cuStreamSynchronize(void* stream) { (void)stream; return 0; }
+EXPORT CUresult cuStreamDestroy_v2(void* stream) { (void)stream; return 0; }
+static int events;
+EXPORT CUresult cuEventCreate(void** event, unsigned int flags)
+{
+    (void)flags;
+    *event = (void*)(uintptr_t)(0x6000 + ++events);
+    return 0;
+}
+EXPORT CUresult cuEventRecord(void* event, void* stream) { (void)event, (void)stream; return 0; }
+EXPORT CUresult cuEventSynchronize(void* event) { (void)event; return 0; }
+EXPORT CUresult cuEventQuery(void* event) { (void)event; return 0; }
+EXPORT CUresult cuEventDestroy_v2(void* event) { (void)event; return 0; }
+EXPORT CUresult cuEventElapsedTime(float* milliseconds, void* start, void* end)
+{
+    (void)start, (void)end;
+    *milliseconds = 1.0f;
+    return 0;
+}
+EXPORT CUresult cuCtxGetCurrent(void** context) { *context = (void*)0x1234; return 0; }
+
 EXPORT CUresult cuGetErrorString(CUresult code, const char** message)
 {
     (void)code;
