@@ -5,8 +5,10 @@
  * with an AMD GPU has no NVAPI at all. This DLL goes in the game folder (where OptiScaler and NGX load nvapi64.dll
  * from) and answers the GPU identity queries: one physical and logical GPU with the architecture, driver version
  * and name below, and the LUID of the system's main GPU so NGX matches it with the D3D12 device and ZLUDA's CUDA
- * device. Every other interface is left unimplemented (NULL), as on a GPU without the feature, unless
- * D4R_NVAPI_CHAIN names another nvapi64.dll (for example fakenvapi) to forward it to.
+ * device. NGX's own queries (DLSS override state, driver feature support) and the common driver, CUDA topology
+ * and memory queries answer as dxvk-nvapi does under Proton, where NGX's CUDA path runs. Every other interface
+ * is left unimplemented (NULL), as on a GPU without the feature, unless D4R_NVAPI_CHAIN names another
+ * nvapi64.dll (for example fakenvapi) to forward it to.
  *
  * Environment (read once):
  *   D4R_NVAPI_GPU_ARCH        AD100 (default), GA100 or TU100: the architecture reported
@@ -145,18 +147,24 @@ static void ensure_initialized(void)
     InitOnceExecuteOnce(&state.once, initialize, NULL, NULL);
 }
 
-/* The adapter LUID: D4R_NVAPI_LUID, else the hardware DXGI adapter with the most dedicated memory (the discrete
-   GPU on a desktop with an enabled iGPU). DXGI is created lazily: never under the loader lock. */
-static int adapter_luid(LUID* luid)
+/* The adapter: D4R_NVAPI_LUID, else the hardware DXGI adapter with the most dedicated memory (the discrete GPU on
+   a desktop with an enabled iGPU). DXGI is created lazily: never under the loader lock. desc may be NULL; with
+   D4R_NVAPI_LUID it is filled from the adapter with that LUID, if any. */
+static int adapter_desc(LUID* luid, DXGI_ADAPTER_DESC1* desc_out)
 {
     char value[64] = {0};
+    int forced = 0;
+    LUID wanted = {0, 0};
     if (GetEnvironmentVariableA("D4R_NVAPI_LUID", value, sizeof(value)) > 0)
     {
         unsigned long high = 0, low = 0;
         if (sscanf(value, "%lx:%lx", &high, &low) == 2)
         {
-            luid->HighPart = (LONG)high, luid->LowPart = (DWORD)low;
-            return 1;
+            wanted.HighPart = (LONG)high, wanted.LowPart = (DWORD)low;
+            *luid = wanted;
+            forced = 1;
+            if (desc_out == NULL)
+                return 1;
         }
     }
     HMODULE dxgi = LoadLibraryA("dxgi.dll");
@@ -165,24 +173,33 @@ static int adapter_luid(LUID* luid)
     static const GUID factory_iid = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
     IDXGIFactory1* factory = NULL;
     if (create == NULL || FAILED(create(&factory_iid, (void**)&factory)))
-        return 0;
+        return forced;
     SIZE_T best_memory = 0;
     int found = 0;
     IDXGIAdapter1* adapter = NULL;
     for (UINT index = 0; factory->lpVtbl->EnumAdapters1(factory, index, &adapter) == S_OK; ++index)
     {
         DXGI_ADAPTER_DESC1 desc;
-        if (SUCCEEDED(adapter->lpVtbl->GetDesc1(adapter, &desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 &&
-            (!found || desc.DedicatedVideoMemory > best_memory))
+        if (SUCCEEDED(adapter->lpVtbl->GetDesc1(adapter, &desc)) &&
+            (forced ? desc.AdapterLuid.HighPart == wanted.HighPart && desc.AdapterLuid.LowPart == wanted.LowPart
+                    : (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 && (!found || desc.DedicatedVideoMemory > best_memory)))
         {
             best_memory = desc.DedicatedVideoMemory;
-            *luid = desc.AdapterLuid;
+            if (!forced)
+                *luid = desc.AdapterLuid;
+            if (desc_out != NULL)
+                *desc_out = desc;
             found = 1;
         }
         adapter->lpVtbl->Release(adapter);
     }
     factory->lpVtbl->Release(factory);
-    return found;
+    return forced || found;
+}
+
+static int adapter_luid(LUID* luid)
+{
+    return adapter_desc(luid, NULL);
 }
 
 static void copy_short_string(char* out, const char* text)
@@ -412,6 +429,211 @@ static NvAPI_Status __cdecl GPU_GetLogicalGpuInfo(void* logical, NV_LOGICAL_GPU_
     return NVAPI_OK;
 }
 
+/* NGX's DLSS override (NVIDIA App) state: no override, as dxvk-nvapi reports */
+typedef struct
+{
+    unsigned int version;
+    unsigned int processIdentifier;
+    unsigned long long feedbackMaskSR, feedbackMaskRR, feedbackMaskFG;
+    float scalingRatio;
+    unsigned int performanceMode, renderPreset, frameGenerationCount, frameGenerationPreset, frameGenerationMode;
+    unsigned int reserved[2];
+} NV_NGX_DLSS_OVERRIDE_GET_STATE_PARAMS_V1;
+_Static_assert(sizeof(NV_NGX_DLSS_OVERRIDE_GET_STATE_PARAMS_V1) == 64, "NV_NGX_DLSS_OVERRIDE_GET_STATE_PARAMS_V1");
+
+typedef struct
+{
+    unsigned int version;
+    unsigned int processIdentifier;
+    unsigned int feature;
+    unsigned long long feedbackMask;
+    unsigned long long reserved[4];
+} NV_NGX_DLSS_OVERRIDE_SET_STATE_PARAMS_V1;
+_Static_assert(sizeof(NV_NGX_DLSS_OVERRIDE_SET_STATE_PARAMS_V1) == 56, "NV_NGX_DLSS_OVERRIDE_SET_STATE_PARAMS_V1");
+
+enum { NV_NGX_DLSS_OVERRIDE_FLAG_ERR_FAILED = 0x10000 };
+
+static NvAPI_Status __cdecl NGX_GetNGXOverrideState(NV_NGX_DLSS_OVERRIDE_GET_STATE_PARAMS_V1* params)
+{
+    if (params == NULL)
+        return NVAPI_INVALID_ARGUMENT;
+    if (params->version != NVAPI_VERSION(sizeof(*params), 1))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    params->feedbackMaskSR = params->feedbackMaskRR = params->feedbackMaskFG = NV_NGX_DLSS_OVERRIDE_FLAG_ERR_FAILED;
+    return NVAPI_OK;
+}
+
+static NvAPI_Status __cdecl NGX_SetNGXOverrideState(NV_NGX_DLSS_OVERRIDE_SET_STATE_PARAMS_V1* params)
+{
+    if (params == NULL)
+        return NVAPI_INVALID_ARGUMENT;
+    if (params->version != NVAPI_VERSION(sizeof(*params), 1))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    return NVAPI_OK;
+}
+
+typedef struct
+{
+    int featureId;
+    unsigned int bSupported : 1;
+    unsigned int reserved1 : 31;
+    unsigned int reserved2[2];
+} NV_NGX_DRIVER_FEATURE_SUPPORT_INFO;
+
+enum { NVAPI_MAX_NGX_FEATURES_PER_QUERY = 16, NV_NGX_DRIVER_FEATURE_ID_SET_FLIP_CONFIG_V2 = 3423695 };
+
+typedef struct
+{
+    unsigned int version;
+    unsigned int featureCount;
+    NV_NGX_DRIVER_FEATURE_SUPPORT_INFO featureSupportInfo[NVAPI_MAX_NGX_FEATURES_PER_QUERY];
+    unsigned int reserved[6];
+} NV_NGX_GET_DRIVER_FEATURE_SUPPORT_PARAMS_V1;
+_Static_assert(sizeof(NV_NGX_GET_DRIVER_FEATURE_SUPPORT_PARAMS_V1) == 288, "NV_NGX_GET_DRIVER_FEATURE_SUPPORT_PARAMS_V1");
+
+/* which NGX features the driver supports: only the flip configuration, as dxvk-nvapi reports */
+static NvAPI_Status __cdecl NGX_GetDriverFeatureSupport(NV_NGX_GET_DRIVER_FEATURE_SUPPORT_PARAMS_V1* params)
+{
+    if (params == NULL)
+        return -14; /* NVAPI_INVALID_POINTER */
+    if (params->version != NVAPI_VERSION(sizeof(*params), 1))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    if (params->featureCount > NVAPI_MAX_NGX_FEATURES_PER_QUERY)
+        return NVAPI_INVALID_ARGUMENT;
+    for (unsigned int i = 0; i < params->featureCount; ++i)
+        params->featureSupportInfo[i].bSupported =
+            params->featureSupportInfo[i].featureId == NV_NGX_DRIVER_FEATURE_ID_SET_FLIP_CONFIG_V2;
+    return NVAPI_OK;
+}
+
+typedef struct
+{
+    unsigned int version;
+    unsigned int driverVersion;
+    char szBuildBranch[NVAPI_SHORT_STRING_MAX];
+    unsigned int flags; /* bIsDCHDriver, bIsNVIDIAStudioPackage, bIsNVIDIAGameReadyPackage, ... */
+    char szBuildBaseBranch[NVAPI_SHORT_STRING_MAX]; /* version 2 */
+    unsigned int reservedEx;
+} NV_DISPLAY_DRIVER_INFO_V2;
+_Static_assert(sizeof(NV_DISPLAY_DRIVER_INFO_V2) == 144, "NV_DISPLAY_DRIVER_INFO_V2");
+enum { DISPLAY_DRIVER_INFO_V1_SIZE = 76 };
+
+/* a DCH Game Ready driver */
+static NvAPI_Status __cdecl SYS_GetDisplayDriverInfo(NV_DISPLAY_DRIVER_INFO_V2* info)
+{
+    if (info == NULL)
+        return NVAPI_INVALID_ARGUMENT;
+    const int v2 = info->version == NVAPI_VERSION(sizeof(*info), 2);
+    if (!v2 && info->version != NVAPI_VERSION(DISPLAY_DRIVER_INFO_V1_SIZE, 1))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    info->driverVersion = state.driver_version;
+    char text[NVAPI_SHORT_STRING_MAX];
+    snprintf(text, sizeof(text), "r%u_00", state.driver_version / 100);
+    copy_short_string(info->szBuildBranch, text);
+    info->flags = 0x1 | 0x4;
+    if (v2)
+    {
+        snprintf(text, sizeof(text), "r%u", state.driver_version / 100);
+        copy_short_string(info->szBuildBaseBranch, text);
+    }
+    return NVAPI_OK;
+}
+
+typedef struct
+{
+    unsigned int version;
+    unsigned int gpuCount;
+    struct
+    {
+        void* hPhysicalGpu;
+        unsigned int flags;
+    } computeGpus[8];
+} NV_COMPUTE_GPU_TOPOLOGY_V1;
+_Static_assert(sizeof(NV_COMPUTE_GPU_TOPOLOGY_V1) == 136, "NV_COMPUTE_GPU_TOPOLOGY_V1");
+
+/* the one GPU, CUDA capable, flags as NVAPI reports a desktop GPU (PhysX capable, enabled, recommended) */
+static NvAPI_Status __cdecl GPU_CudaEnumComputeCapableGpus(NV_COMPUTE_GPU_TOPOLOGY_V1* topology)
+{
+    if (topology == NULL)
+        return NVAPI_INVALID_ARGUMENT;
+    if (topology->version != NVAPI_VERSION(sizeof(*topology), 1))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    topology->gpuCount = 1;
+    topology->computeGpus[0].hPhysicalGpu = PHYSICAL_HANDLE;
+    topology->computeGpus[0].flags = 0x0b;
+    return NVAPI_OK;
+}
+
+typedef struct
+{
+    unsigned int version;
+    unsigned int reserved0;
+    unsigned long long reserved1;
+    unsigned int rayTracingCores;
+    unsigned int tensorCores;
+    unsigned int reserved2[14];
+} NV_GPU_INFO_V2;
+_Static_assert(sizeof(NV_GPU_INFO_V2) == 80, "NV_GPU_INFO_V2");
+
+static NvAPI_Status __cdecl GPU_GetGPUInfo(void* physical, NV_GPU_INFO_V2* info)
+{
+    if (physical != PHYSICAL_HANDLE)
+        return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+    if (info == NULL)
+        return NVAPI_INVALID_ARGUMENT;
+    const unsigned int version = info->version;
+    if (version == NVAPI_VERSION(8, 1))
+        memset(info, 0, 8);
+    else if (version == NVAPI_VERSION(sizeof(*info), 2))
+    {
+        memset(info, 0, sizeof(*info));
+        if (state.architecture >= 0x160) /* RTX: an RTX 4090's units */
+            info->rayTracingCores = 128, info->tensorCores = 512;
+    }
+    else
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    info->version = version;
+    return NVAPI_OK;
+}
+
+typedef struct
+{
+    unsigned int version;
+    unsigned int dedicatedVideoMemory; /* KB, as all below */
+    unsigned int availableDedicatedVideoMemory;
+    unsigned int systemVideoMemory;
+    unsigned int sharedSystemMemory;
+    unsigned int curAvailableDedicatedVideoMemory; /* version 2 */
+    unsigned int dedicatedVideoMemoryEvictionsSize, dedicatedVideoMemoryEvictionCount; /* version 3 */
+} NV_DISPLAY_DRIVER_MEMORY_INFO_V3;
+
+/* the adapter's memory as DXGI reports it */
+static NvAPI_Status __cdecl GPU_GetMemoryInfo(void* physical, NV_DISPLAY_DRIVER_MEMORY_INFO_V3* info)
+{
+    if (physical != PHYSICAL_HANDLE)
+        return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+    if (info == NULL)
+        return NVAPI_INVALID_ARGUMENT;
+    const unsigned int version = info->version;
+    if (version != NVAPI_VERSION(20, 1) && version != NVAPI_VERSION(24, 2) && version != NVAPI_VERSION(32, 3))
+        return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+    LUID luid;
+    DXGI_ADAPTER_DESC1 desc;
+    memset(&desc, 0, sizeof(desc));
+    if (!adapter_desc(&luid, &desc) || desc.DedicatedVideoMemory == 0)
+        return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+    const unsigned long long kb = 1024;
+    info->dedicatedVideoMemory = (unsigned int)(desc.DedicatedVideoMemory / kb);
+    info->availableDedicatedVideoMemory = info->dedicatedVideoMemory;
+    info->systemVideoMemory = (unsigned int)(desc.DedicatedSystemMemory / kb);
+    info->sharedSystemMemory = (unsigned int)(desc.SharedSystemMemory / kb);
+    if (version != NVAPI_VERSION(20, 1))
+        info->curAvailableDedicatedVideoMemory = info->dedicatedVideoMemory;
+    if (version == NVAPI_VERSION(32, 3))
+        info->dedicatedVideoMemoryEvictionsSize = info->dedicatedVideoMemoryEvictionCount = 0;
+    return NVAPI_OK;
+}
+
 static const struct
 {
     unsigned int id;
@@ -435,6 +657,13 @@ static const struct
     {0xc33baeb1, (void*)&GPU_GetGPUType},
     {0x0ff07fde, (void*)&GPU_GetAdapterIdFromPhysicalGpu},
     {0x842b066e, (void*)&GPU_GetLogicalGpuInfo},
+    {0x3fd96fba, (void*)&NGX_GetNGXOverrideState},
+    {0xb60fcb4e, (void*)&NGX_SetNGXOverrideState},
+    {0x6194b19d, (void*)&NGX_GetDriverFeatureSupport},
+    {0x721faceb, (void*)&SYS_GetDisplayDriverInfo},
+    {0x5786cc6e, (void*)&GPU_CudaEnumComputeCapableGpus},
+    {0xafd1b02c, (void*)&GPU_GetGPUInfo},
+    {0x07f9b368, (void*)&GPU_GetMemoryInfo},
 };
 
 /* fakenvapi's own interfaces: OptiScaler takes an NVAPI that answers them for fakenvapi, that is, for no NVIDIA

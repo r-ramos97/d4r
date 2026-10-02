@@ -35,7 +35,8 @@ Install
    version.dll, this file and a d4r folder. (OptiScaler enables DLSS only on an NVIDIA GPU; d4r's
    version.dll loads d4r's nvapi64.dll before OptiScaler starts, so it sees one. If the folder already has
    a version.dll from another mod, the two cannot be used together.)
-2. Copy OptiScaler.dll from OptiScaler 0.9.4 into the same folder as dxgi.dll, and its OptiScaler.ini.
+2. Copy OptiScaler.dll from OptiScaler 0.9.4 into the same folder, renamed to dxgi.dll, together with
+   its OptiScaler.ini.
 3. Copy nvngx_dlss.dll into the d4r folder, and _nvngx.dll into d4r\ngx.
 4. Open PowerShell in the game folder and run:
        powershell -ExecutionPolicy Bypass -File d4r\setup.ps1

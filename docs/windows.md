@@ -95,7 +95,9 @@ writes), and what the copies cost against today's readback.
 
 NGX picks the network weights by GPU architecture, which it reads through NVAPI; OptiScaler offers its DLSS
 backend only when NVAPI says NVIDIA. `tools/d4r_nvapi_windows.c` answers the identity queries (one GPU, AD100,
-driver 596.36 like the tested NGX core, the main DXGI adapter's LUID) and returns NULL for the rest, as for a
+driver 596.36 like the tested NGX core, the main DXGI adapter's LUID), NGX's own queries (no DLSS override,
+driver feature support) and the common driver, CUDA topology and memory queries the way dxvk-nvapi does under
+Proton, where NGX's CUDA path is known to run, and returns NULL for the rest, as for a
 feature the GPU lacks, unless `D4R_NVAPI_CHAIN` names another nvapi64.dll (fakenvapi) to forward them to. It
 logs every interface it is asked for, by name, to `d4r_nvapi.log`.
 
