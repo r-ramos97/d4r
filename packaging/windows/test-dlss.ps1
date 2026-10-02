@@ -55,8 +55,13 @@ if (Test-Path -LiteralPath $probe -PathType Leaf) {
         $process.Kill()
         Add-Content -LiteralPath $report "RESULT: the check did not finish within a minute (stopped)"
     }
-    Get-Content -LiteralPath $report | Where-Object { $_ -match "^(RESULT|VRAM sharing|d4r keeps|Same-frame)" } |
-        ForEach-Object { Write-Host "  $_" }
+    $summary = @(Get-Content -LiteralPath $report | Where-Object { $_ -match "^(RESULT|VRAM sharing|d4r keeps|Same-frame)" })
+    if ($summary.Count -eq 0) {
+        # no summary (the check crashed?): its last lines
+        $summary = @("the check ended without a result; its last lines:") +
+                   @(Get-Content -LiteralPath $report -Tail 5)
+    }
+    $summary | ForEach-Object { Write-Host "  $_" }
     Write-Host "  (details in $report)"
     Write-Host ""
 }

@@ -252,9 +252,8 @@ bool wait_stream(const Bridge& cuda, DWORD timeoutMs)
 }
 } // namespace
 
-int main(int argc, char** argv)
+static int probe(int argc, char** argv)
 {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2)
     {
         std::printf("usage: %s NVCUDA_BRIDGE_DLL [WIDTH HEIGHT]\n", argv[0]);
@@ -835,4 +834,15 @@ int main(int argc, char** argv)
     if (handle != nullptr)
         CloseHandle(handle);
     return memory ? 0 : 1;
+}
+
+int main(int argc, char** argv)
+{
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const int code = probe(argc, argv);
+    // test-dlss.ps1 shows the RESULT lines: an early stop gets one too
+    if (code == 2)
+        std::printf("\nRESULT: the check stopped early (the line above says why); without D3D12, HIP or ZLUDA here DLSS "
+                    "cannot run either\n");
+    return code;
 }

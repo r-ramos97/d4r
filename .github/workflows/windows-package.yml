@@ -135,7 +135,7 @@ jobs:
           $out = powershell -ExecutionPolicy Bypass -File game\d4r\test-dlss.ps1 -GameFolder game -Frames 2 | Out-String
           Write-Host $out
           if ($LASTEXITCODE -ne 1) { throw "expected exit code 1 (no DLSS on this runner), got $LASTEXITCODE" }
-          foreach ($line in "VRAM sharing check", "harness exit code", "DLSS did not complete") {
+          foreach ($line in "VRAM sharing check", "  RESULT: ", "harness exit code", "DLSS did not complete") {
             if (-not $out.Contains($line)) { throw "missing in the output: $line" }
           }
           if (-not (Test-Path game\d4r\interop-report.txt)) { throw "no d4r\interop-report.txt" }
