@@ -1,9 +1,7 @@
 #include <windows.h>
 #include <dirent.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +9,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "d4r_bridge_platform.h"
+#include "d4r_fatbin.h"
+#ifdef D4R_NATIVE_WINDOWS
+#include "d4r_hip_props.h"
+#endif
 #include "d4r_native_selection.h"
 
 typedef int CUresult;
@@ -52,6 +55,7 @@ enum
     CUDA_ERROR_NOT_INITIALIZED = 3,
     CUDA_ERROR_INVALID_VALUE = 1,
     CUDA_ERROR_OUT_OF_MEMORY = 2,
+    CUDA_ERROR_INVALID_DEVICE = 101,
     CUDA_ERROR_NOT_FOUND = 500,
     CUDA_ERROR_NOT_READY = 600,
     CUDA_ERROR_NOT_SUPPORTED = 801,
@@ -233,7 +237,7 @@ int WINAPI d4rSetEnv(const char* name, const char* value, int overwrite)
 
 static void expand_home(const char* path, char* out, size_t size)
 {
-    const char* home = getenv("HOME");
+    const char* home = d4r_home();
     if (path[0] == '~' && path[1] == '/' && home != NULL)
         snprintf(out, size, "%s%s", home, path + 1);
     else
@@ -244,15 +248,84 @@ static void make_directories(const char* path)
 {
     char partial[1024];
     snprintf(partial, sizeof(partial), "%s", path);
-    for (char* slash = strchr(partial + 1, '/'); slash != NULL; slash = strchr(slash + 1, '/'))
+    for (char* slash = partial + 1; *slash != '\0'; ++slash)
     {
+        if (!d4r_is_separator(*slash))
+            continue;
+        const char separator = *slash;
         *slash = '\0';
-        mkdir(partial, 0755);
-        *slash = '/';
+        d4r_mkdir(partial);
+        *slash = separator;
     }
-    mkdir(partial, 0755);
+    d4r_mkdir(partial);
 }
 
+#ifdef D4R_NATIVE_WINDOWS
+/* ZLUDA's Windows build delay-loads HIP by name (amdhip64_7.dll, else amdhip64_6.dll), and HIP loads its
+   comgr compiler library by name. AMD's driver and the HIP SDK install them; D4R_ROCM_DIR (d4r.ini RocmDir)
+   or else HIP_PATH (set by the HIP SDK installer) names an installation whose bin folder is loaded from
+   first, so ZLUDA and HIP find that copy already loaded. */
+static void preload_hip(void)
+{
+    const char* configured = getenv("D4R_ROCM_DIR");
+    const char* root = configured != NULL && configured[0] != '\0' ? configured : getenv("HIP_PATH");
+    if (root == NULL || root[0] == '\0')
+    {
+        tracef("HIP: neither D4R_ROCM_DIR nor HIP_PATH is set; ZLUDA loads amdhip64 from the DLL search path");
+        return;
+    }
+    char bin[1024];
+    snprintf(bin, sizeof(bin), "%s/bin", root);
+    DIR* directory = opendir(bin);
+    if (directory == NULL)
+    {
+        tracef("HIP: %s does not exist; ZLUDA loads amdhip64 from the DLL search path", bin);
+        return;
+    }
+    for (struct dirent* entry; (entry = readdir(directory)) != NULL;)
+    {
+        const size_t length = strlen(entry->d_name);
+        if (strncmp(entry->d_name, "amd_comgr", 9) != 0 || length < 4 || _stricmp(entry->d_name + length - 4, ".dll") != 0)
+            continue;
+        char full[1400];
+        snprintf(full, sizeof(full), "%s/%s", bin, entry->d_name);
+        tracef("HIP: %s %s", full, dlopen(full, RTLD_NOW) != NULL ? "loaded" : "failed to load");
+    }
+    closedir(directory);
+    static const char* const runtimes[] = {"amdhip64_7.dll", "amdhip64_6.dll"};
+    for (size_t i = 0; i < sizeof(runtimes) / sizeof(runtimes[0]); ++i)
+    {
+        char full[1400];
+        snprintf(full, sizeof(full), "%s/%s", bin, runtimes[i]);
+        if (access(full, R_OK) != 0)
+            continue;
+        const int loaded = dlopen(full, RTLD_NOW) != NULL;
+        tracef("HIP: %s %s", full, loaded ? "loaded" : "failed to load");
+        if (loaded)
+            break;
+    }
+}
+
+/* path relative to the folder holding this DLL */
+static void beside_bridge(const char* relative, char* out, size_t size)
+{
+    HMODULE self = NULL;
+    char module[MAX_PATH] = {0};
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(void*)&beside_bridge, &self) ||
+        GetModuleFileNameA(self, module, sizeof(module)) == 0)
+    {
+        snprintf(out, size, "%s", relative);
+        return;
+    }
+    char* slash = strrchr(module, '\\');
+    if (slash == NULL)
+        slash = strrchr(module, '/');
+    if (slash != NULL)
+        *slash = '\0';
+    snprintf(out, size, "%s/%s", module, relative);
+}
+#else
 enum { LIBRARY_DIR_CAPACITY = 12 };
 static char library_dirs[LIBRARY_DIR_CAPACITY][1024];
 static int library_dir_count;
@@ -354,6 +427,8 @@ static void preload_rocm(void)
     }
 }
 
+#endif
+
 typedef struct
 {
     char name[128];
@@ -390,9 +465,129 @@ static void native_cleanup(void)
         remove_directory(native_served);
 }
 
+#ifdef D4R_NATIVE_WINDOWS
+/* HIP on Windows lists every AMD GPU, and a Ryzen 7000/9000 desktop with its integrated GPU enabled can list
+   that one first, where ZLUDA's device 0 would run DLSS. The bridge therefore shows NGX a single CUDA device
+   (cuDeviceGetCount 1, cuDeviceGet(0)), the HIP device:
+     - D4R_HIP_DEVICE, if set;
+     - else the one whose LUID is the D3D12 adapter's (D4R_CUDA_LUID_LOW/HIGH, which the NGX shim sets from the
+       game's device before NGX starts);
+     - else the one with the most compute units.
+   ZLUDA's CUdevice is the HIP ordinal. */
+enum { MAX_HIP_DEVICES = 16 };
+static struct
+{
+    int count; /* listed devices, 0 when HIP cannot be queried */
+    int compute_units[MAX_HIP_DEVICES];
+    unsigned char luid[MAX_HIP_DEVICES][8];
+    char target[MAX_HIP_DEVICES][64]; /* "gfx1201", "" when HIP reports no gfx target */
+    int chosen;                       /* -1: no choice, ZLUDA's own device numbering */
+} hip_devices = {.chosen = -1};
+static pthread_once_t hip_devices_once = PTHREAD_ONCE_INIT;
+
+static unsigned int get_process_u32(const char* name, unsigned int fallback);
+
+static void query_hip_devices(void)
+{
+    /* HIP is loaded (preload_hip, or the driver's copy through the DLL search path) before ZLUDA */
+    typedef int (*HIP_GET_DEVICE_COUNT_FN)(int*);
+    typedef int (*HIP_GET_DEVICE_PROPERTIES_FN)(void*, int);
+    HMODULE hip = GetModuleHandleA("amdhip64_7.dll");
+    if (hip == NULL)
+        hip = GetModuleHandleA("amdhip64_6.dll");
+    if (hip == NULL)
+        hip = LoadLibraryA("amdhip64_7.dll");
+    if (hip == NULL)
+        hip = LoadLibraryA("amdhip64_6.dll");
+    HIP_GET_DEVICE_COUNT_FN get_count = hip != NULL ? (HIP_GET_DEVICE_COUNT_FN)(void*)GetProcAddress(hip, "hipGetDeviceCount") : NULL;
+    HIP_GET_DEVICE_PROPERTIES_FN get_properties =
+        hip != NULL ? (HIP_GET_DEVICE_PROPERTIES_FN)(void*)GetProcAddress(hip, "hipGetDevicePropertiesR0600") : NULL;
+    int count = 0;
+    if (get_count == NULL || get_properties == NULL || get_count(&count) != 0 || count < 1)
+    {
+        tracef("HIP: cannot list GPUs (amdhip64 %p, %d devices); set D4R_GPU_ARCH for native kernels", (void*)hip, count);
+        return;
+    }
+    hip_devices.count = count < MAX_HIP_DEVICES ? count : MAX_HIP_DEVICES;
+    int largest = -1;
+    for (int device = 0; device < hip_devices.count; ++device)
+    {
+        union
+        {
+            D4rHipDevicePropPrefix prefix;
+            unsigned char bytes[HIP_DEVICE_PROP_R0600_SIZE + 512];
+        } properties;
+        memset(&properties, 0, sizeof(properties));
+        if (get_properties(&properties, device) != 0)
+            continue;
+        properties.prefix.gcnArchName[sizeof(properties.prefix.gcnArchName) - 1] = '\0';
+        properties.prefix.name[sizeof(properties.prefix.name) - 1] = '\0';
+        /* "gfx1201:sramecc-:xnack-" -> "gfx1201" */
+        char* target = hip_devices.target[device];
+        snprintf(target, sizeof(hip_devices.target[device]), "%s", properties.prefix.gcnArchName);
+        target[strcspn(target, ":")] = '\0';
+        if (strncmp(target, "gfx", 3) != 0)
+            target[0] = '\0';
+        hip_devices.compute_units[device] = properties.prefix.multiProcessorCount;
+        memcpy(hip_devices.luid[device], properties.prefix.luid, 8);
+        const unsigned char* luid = hip_devices.luid[device];
+        tracef("HIP device %d: %s %s, %d CUs%s, LUID %02x%02x%02x%02x:%02x%02x%02x%02x", device,
+               properties.prefix.name, target[0] != '\0' ? target : "(no gfx target)",
+               properties.prefix.multiProcessorCount, properties.prefix.integrated ? ", integrated" : "", luid[7],
+               luid[6], luid[5], luid[4], luid[3], luid[2], luid[1], luid[0]);
+        if (target[0] != '\0' && properties.prefix.multiProcessorCount > 0 &&
+            (largest < 0 || properties.prefix.multiProcessorCount > hip_devices.compute_units[largest]))
+            largest = device;
+    }
+
+    const char* reason = "the most compute units";
+    int chosen = largest;
+    const char* forced = getenv("D4R_HIP_DEVICE");
+    char* end = NULL;
+    const long index = forced != NULL ? strtol(forced, &end, 10) : -1;
+    const unsigned int low = get_process_u32("D4R_CUDA_LUID_LOW", 0xffffffffu);
+    const unsigned int high = get_process_u32("D4R_CUDA_LUID_HIGH", 0xffffffffu);
+    if (forced != NULL && end != forced && *end == '\0' && index >= 0 && index < hip_devices.count)
+    {
+        chosen = (int)index;
+        reason = "D4R_HIP_DEVICE";
+    }
+    else if (low != 0xffffffffu && high != 0xffffffffu)
+    {
+        unsigned char wanted[8];
+        memcpy(wanted, &low, 4);
+        memcpy(wanted + 4, &high, 4);
+        for (int device = 0; device < hip_devices.count; ++device)
+            if (memcmp(hip_devices.luid[device], wanted, 8) == 0)
+            {
+                chosen = device;
+                reason = "the D3D12 adapter's LUID";
+                break;
+            }
+    }
+    if (chosen < 0)
+    {
+        tracef("HIP: no GPU with a gfx target; CUDA devices are ZLUDA's");
+        return;
+    }
+    hip_devices.chosen = chosen;
+    if (hip_devices.count > 1)
+        tracef("HIP: %d GPUs; DLSS runs on device %d (%s, chosen by %s), the only CUDA device NGX sees; "
+               "D4R_HIP_DEVICE overrides", hip_devices.count, chosen, hip_devices.target[chosen], reason);
+}
+
+/* the HIP ordinal behind the CUDA device NGX sees, -1 to pass ZLUDA's numbering through */
+static int ngx_device(void)
+{
+    pthread_once(&hip_devices_once, query_hip_devices);
+    return hip_devices.chosen;
+}
+#endif
+
 /* The gfx target ("gfx1101") of the GPU DLSS runs on, "" when unknown: D4R_GPU_ARCH if set, else the KFD
-   topology's GPU with the most SIMDs. With an integrated and a discrete GPU (Ryzen 7000/9000 desktops) the
-   first KFD GPU node can be the integrated one, whose kernels would not match the discrete GPU. */
+   topology's GPU with the most SIMDs (Windows: the HIP device NGX gets, ngx_device). With an integrated and a
+   discrete GPU (Ryzen 7000/9000 desktops) the first GPU can be the integrated one, whose kernels would not match
+   the discrete GPU. */
 static void gpu_architecture(char* out, size_t size)
 {
     out[0] = '\0';
@@ -402,6 +597,13 @@ static void gpu_architecture(char* out, size_t size)
         snprintf(out, size, "%s", forced);
         return;
     }
+#ifdef D4R_NATIVE_WINDOWS
+    const int device = ngx_device();
+    if (device >= 0)
+        snprintf(out, size, "%s", hip_devices.target[device]);
+    else
+        tracef("native kernels: no HIP GPU found; set D4R_GPU_ARCH");
+#else
     unsigned long best_simds = 0;
     int gpus = 0;
     for (int node = 0; node < 16; ++node)
@@ -430,6 +632,7 @@ static void gpu_architecture(char* out, size_t size)
     }
     if (gpus > 1)
         tracef("native kernels: %d GPUs; using the one with the most SIMDs (%s); D4R_GPU_ARCH overrides", gpus, out);
+#endif
 }
 
 static void prepare_native_kernels(const char* cache_home)
@@ -493,7 +696,9 @@ static void prepare_native_kernels(const char* cache_home)
 
     /* <cache>/d4r-native/<pid>; directories of processes that no longer exist are removed */
     char base[1024];
-    snprintf(base, sizeof(base), "%s/d4r-native", cache_home != NULL ? cache_home : "/tmp");
+    char user_cache[1024];
+    snprintf(base, sizeof(base), "%s/d4r-native",
+             cache_home != NULL ? cache_home : d4r_user_cache_base(user_cache, sizeof(user_cache)));
     make_directories(base);
     DIR* directory = opendir(base);
     if (directory != NULL)
@@ -502,7 +707,7 @@ static void prepare_native_kernels(const char* cache_home)
         {
             char* end = NULL;
             const long pid = strtol(entry->d_name, &end, 10);
-            if (pid > 0 && end != NULL && *end == '\0' && kill((pid_t)pid, 0) != 0 && errno == ESRCH)
+            if (pid > 0 && end != NULL && *end == '\0' && pid != d4r_process_id() && d4r_process_exited(pid))
             {
                 char stale[1400];
                 snprintf(stale, sizeof(stale), "%s/%s", base, entry->d_name);
@@ -511,9 +716,9 @@ static void prepare_native_kernels(const char* cache_home)
         }
         closedir(directory);
     }
-    snprintf(native_served, sizeof(native_served), "%s/%ld", base, (long)getpid());
+    snprintf(native_served, sizeof(native_served), "%s/%ld", base, d4r_process_id());
     remove_directory(native_served);
-    if (mkdir(native_served, 0755) != 0)
+    if (d4r_mkdir(native_served) != 0)
     {
         set_load_error("cannot create %s; native kernels disabled", native_served);
         native_served[0] = '\0';
@@ -528,90 +733,14 @@ static void prepare_native_kernels(const char* cache_home)
            native_kernel_count, native_source, native_served);
 }
 
-/* LZ4 block decoder for compressed fatbin entries; returns the decoded size, 0 on bad input. */
-static size_t lz4_block(const unsigned char* src, size_t src_size, unsigned char* dst, size_t dst_size)
-{
-    size_t i = 0, o = 0;
-    while (i < src_size)
-    {
-        const unsigned int token = src[i++];
-        size_t literals = token >> 4;
-        if (literals == 15)
-        {
-            unsigned char b;
-            do
-            {
-                if (i >= src_size)
-                    return 0;
-                b = src[i++];
-                literals += b;
-            } while (b == 255);
-        }
-        if (literals > src_size - i || literals > dst_size - o)
-            return 0;
-        memcpy(dst + o, src + i, literals);
-        i += literals;
-        o += literals;
-        if (i >= src_size || o >= dst_size)
-            break;
-        if (src_size - i < 2)
-            return 0;
-        const size_t offset = src[i] | ((size_t)src[i + 1] << 8);
-        i += 2;
-        if (offset == 0 || offset > o)
-            return 0;
-        size_t match = token & 15;
-        if (match == 15)
-        {
-            unsigned char b;
-            do
-            {
-                if (i >= src_size)
-                    return 0;
-                b = src[i++];
-                match += b;
-            } while (b == 255);
-        }
-        match += 4;
-        if (match > dst_size - o)
-            match = dst_size - o;
-        for (size_t k = 0; k < match; ++k, ++o)
-            dst[o] = dst[o - offset];
-    }
-    return o;
-}
-
-static int is_ptx_name_char(unsigned char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$';
-}
-
 /* Links the native kernel of every .entry of one PTX module whose text matches the manifest. */
-static void verify_ptx_module(const unsigned char* text, size_t size)
+static void verify_ptx_module(const unsigned char* text, size_t size, void* context)
 {
-    while (size > 0 && text[size - 1] == '\0')
-        --size;
-    uint64_t hash = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < size; ++i)
-        hash = (hash ^ text[i]) * 0x100000001b3ull;
-    for (size_t i = 0; i + 7 < size; ++i)
+    (void)context;
+    const uint64_t hash = d4r_ptx_hash(text, &size);
+    char name[sizeof(native_kernels[0].name)];
+    for (size_t position = 0; d4r_next_ptx_entry(text, size, &position, name, sizeof(name));)
     {
-        if (memcmp(text + i, ".entry", 6) != 0 || (text[i + 6] != ' ' && text[i + 6] != '\t' && text[i + 6] != '\n'))
-            continue;
-        size_t p = i + 6;
-        while (p < size && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r'))
-            ++p;
-        const size_t start = p;
-        while (p < size && is_ptx_name_char(text[p]))
-            ++p;
-        const size_t length = p - start;
-        while (p < size && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r'))
-            ++p;
-        if (length == 0 || length >= sizeof(native_kernels[0].name) || p >= size || text[p] != '(')
-            continue;
-        char name[128];
-        memcpy(name, text + start, length);
-        name[length] = '\0';
         int known = 0, matched = 0;
         uint64_t expected = 0;
         for (size_t k = 0; k < native_kernel_count; ++k)
@@ -628,7 +757,7 @@ static void verify_ptx_module(const unsigned char* text, size_t size)
                     char target[1400], link_path[1400];
                     snprintf(target, sizeof(target), "%s/%s.hsaco", native_source, name);
                     snprintf(link_path, sizeof(link_path), "%s/%s.hsaco", native_served, name);
-                    if (symlink(target, link_path) == 0 || errno == EEXIST)
+                    if (d4r_link_file(target, link_path) == 0)
                         native_kernels[k].linked = 1;
                     tracef("native kernel %s: %s", name, native_kernels[k].linked ? "verified" : "link failed");
                 }
@@ -637,7 +766,6 @@ static void verify_ptx_module(const unsigned char* text, size_t size)
         if (known && !matched)
             tracef("native kernel %s not used: this DLSS's PTX for it differs (%016llx, expected %016llx)", name,
                    (unsigned long long)hash, (unsigned long long)expected);
-        i = p;
     }
 }
 
@@ -649,54 +777,15 @@ static void verify_native_kernels(const void* image)
     uint32_t magic = 0;
     memcpy(&magic, bytes, sizeof(magic));
     pthread_mutex_lock(&native_lock);
-    if (magic != 0xba55ed50u)
+    if (magic != D4R_FATBIN_MAGIC)
     {
         /* a PTX text image */
         const unsigned char* end = (const unsigned char*)memchr(bytes, 0, 64u * 1024u * 1024u);
         if (end != NULL)
-            verify_ptx_module(bytes, (size_t)(end - bytes));
-        pthread_mutex_unlock(&native_lock);
-        return;
+            verify_ptx_module(bytes, (size_t)(end - bytes), NULL);
     }
-    uint16_t version = 0, header_size = 0;
-    uint64_t files_size = 0;
-    memcpy(&version, bytes + 4, sizeof(version));
-    memcpy(&header_size, bytes + 6, sizeof(header_size));
-    memcpy(&files_size, bytes + 8, sizeof(files_size));
-    if (version == 1 && header_size >= 16 && header_size <= 4096 && files_size <= 256u * 1024u * 1024u)
-    {
-        size_t offset = header_size;
-        const size_t end = (size_t)header_size + (size_t)files_size;
-        while (offset + 64 <= end)
-        {
-            uint16_t kind = 0;
-            uint32_t entry_header = 0;
-            uint64_t entry_size = 0, flags = 0, decompressed = 0;
-            memcpy(&kind, bytes + offset, sizeof(kind));
-            memcpy(&entry_header, bytes + offset + 4, sizeof(entry_header));
-            memcpy(&entry_size, bytes + offset + 8, sizeof(entry_size));
-            memcpy(&flags, bytes + offset + 40, sizeof(flags));
-            if (entry_header >= 64)
-                memcpy(&decompressed, bytes + offset + 56, sizeof(decompressed));
-            if (entry_header < 16 || entry_size > end - offset - entry_header)
-                break;
-            const unsigned char* payload = bytes + offset + entry_header;
-            if (kind == 1) /* PTX */
-            {
-                if ((flags & 0x2000) != 0 && decompressed != 0 && decompressed <= 256u * 1024u * 1024u)
-                {
-                    unsigned char* text = (unsigned char*)malloc((size_t)decompressed);
-                    const size_t size = text != NULL ? lz4_block(payload, (size_t)entry_size, text, (size_t)decompressed) : 0;
-                    if (size != 0)
-                        verify_ptx_module(text, size);
-                    free(text);
-                }
-                else
-                    verify_ptx_module(payload, (size_t)entry_size);
-            }
-            offset += entry_header + entry_size;
-        }
-    }
+    else
+        d4r_fatbin_ptx(bytes, SIZE_MAX, verify_ptx_module, NULL);
     pthread_mutex_unlock(&native_lock);
 }
 
@@ -768,6 +857,29 @@ static void load_zluda(void)
        (such as Proton games) whose library search path is not ours. */
     const char* configured = getenv("D4R_ZLUDA_LIBCUDA");
     char path[1024];
+#ifdef D4R_NATIVE_WINDOWS
+    /* ZLUDA's nvcuda.dll, renamed so that it never answers a LoadLibrary("nvcuda.dll") meant for this bridge */
+    if (configured != NULL && configured[0] != '\0')
+        expand_home(configured, path, sizeof(path));
+    else
+        beside_bridge("zluda/zluda_nvcuda.dll", path, sizeof(path));
+    preload_hip();
+    /* ZLUDA delay-loads HIP: without it ZLUDA's first HIP call raises an exception that ends the process (the
+       game), so a missing HIP fails cuInit here instead, and NGX reports DLSS as unavailable. */
+    if (LoadLibraryA("amdhip64_7.dll") == NULL && LoadLibraryA("amdhip64_6.dll") == NULL)
+    {
+        set_load_error("AMD's HIP runtime (amdhip64_7.dll or amdhip64_6.dll) is not installed: install a current AMD "
+                       "Adrenalin driver and the AMD HIP SDK for Windows (or set RocmDir in d4r.ini)");
+        return;
+    }
+    cuda_library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (cuda_library == NULL)
+    {
+        set_load_error("loading ZLUDA (%s) failed: %s; is it there, and are AMD's HIP SDK (amdhip64) and GPU "
+                       "driver installed?", path, dlerror() != NULL ? dlerror() : "unknown error");
+        return;
+    }
+#else
     expand_home(configured != NULL && configured[0] != '\0' ? configured : "libcuda.so", path, sizeof(path));
     init_library_dirs();
     if (getenv("D4R_ROCM_DIR") != NULL)
@@ -785,6 +897,7 @@ static void load_zluda(void)
         fprintf(stderr, "[d4r nvcuda] %s\n", load_error);
         return;
     }
+#endif
     load_error[0] = '\0';
     const char* cache = getenv("D4R_ZLUDA_CACHE_HOME");
     char cache_home[1024] = {0};
@@ -798,16 +911,10 @@ static void load_zluda(void)
         /* FAST_MATH is not fingerprinted by older ZLUDA runtimes. Use a separate cache even
            when a previous run explicitly enabled that experimental compiler switch. */
         char base[1024];
-        const char* xdg = getenv("XDG_CACHE_HOME");
         if (cache_home[0] != '\0')
             snprintf(base, sizeof(base), "%s", cache_home);
-        else if (xdg != NULL && xdg[0] != '\0')
-            snprintf(base, sizeof(base), "%s", xdg);
         else
-        {
-            const char* home = getenv("HOME");
-            snprintf(base, sizeof(base), "%s/.cache", home != NULL ? home : "/tmp");
-        }
+            d4r_user_cache_base(base, sizeof(base));
         if (snprintf(cache_home, sizeof(cache_home), "%s/d4r-accuracy", base) >= (int)sizeof(cache_home))
         {
             set_load_error("accuracy cache path is too long");
@@ -822,7 +929,7 @@ static void load_zluda(void)
         const char* previous = getenv("XDG_CACHE_HOME");
         char* saved = previous != NULL ? strdup(previous) : NULL;
         setenv("XDG_CACHE_HOME", cache_home, 1);
-        typedef CUresult(__attribute__((sysv_abi)) * INIT_FN)(unsigned int);
+        typedef CUresult(D4R_UNIX_ABI * INIT_FN)(unsigned int);
         INIT_FN init = (INIT_FN)dlsym(cuda_library, "cuInit");
         const CUresult result = init != NULL ? init(0) : CUDA_ERROR_NOT_INITIALIZED;
         if (saved != NULL)
@@ -832,8 +939,13 @@ static void load_zluda(void)
         free(saved);
         if (result != CUDA_SUCCESS)
             set_load_error("ZLUDA cuInit failed (%d): is the ROCm HIP runtime installed and the GPU supported?", result);
+#ifdef D4R_NATIVE_WINDOWS
+        else /* ZLUDA's Windows build keeps its cache in %LOCALAPPDATA%\zluda whatever XDG_CACHE_HOME says */
+            tracef("ZLUDA initialised; its kernel cache is in %%LOCALAPPDATA%%\\zluda, native kernels in %s", cache_home);
+#else
         else
             tracef("ZLUDA initialised; kernel cache in %s", cache_home);
+#endif
     }
 }
 
@@ -892,51 +1004,51 @@ static int trace_verbose(void)
     } while (0)
 
 /* Wine exposes the PE side with the Windows ABI; ZLUDA's libcuda.so uses SysV. */
-typedef CUresult(__attribute__((sysv_abi)) *CUINIT_FN)(unsigned int);
-typedef CUresult(__attribute__((sysv_abi)) *CUDEVICEGETCOUNT_FN)(int*);
-typedef CUresult(__attribute__((sysv_abi)) *CUDEVICEGET_FN)(CUdevice*, int);
-typedef CUresult(__attribute__((sysv_abi)) *CUCTXCREATE_FN)(CUcontext*, unsigned int, CUdevice);
-typedef CUresult(__attribute__((sysv_abi)) *CUDEVICEGETLUID_FN)(char*, unsigned int*, CUdevice);
-typedef CUresult(__attribute__((sysv_abi)) *CUDEVICEGETATTRIBUTE_FN)(int*, int, CUdevice);
-typedef CUresult(__attribute__((sysv_abi)) *CUDEVICEGETUUID_FN)(void*, CUdevice);
-typedef CUresult(__attribute__((sysv_abi)) *CUCTX_CURRENT_FN)(CUcontext);
-typedef CUresult(__attribute__((sysv_abi)) *CUCTX_POP_CURRENT_FN)(CUcontext*);
-typedef CUresult(__attribute__((sysv_abi)) *CUCTX_GET_DEVICE_FN)(CUdevice*);
-typedef CUresult(__attribute__((sysv_abi)) *CUCTXDESTROY_FN)(CUcontext);
-typedef CUresult(__attribute__((sysv_abi)) *CUCTX_SYNCHRONIZE_FN)(void);
-typedef CUresult(__attribute__((sysv_abi)) *CUMODULELOADDATA_FN)(CUmodule*, const void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUMODULELOADDATAEX_FN)(CUmodule*, const void*, unsigned int, int*, void**);
-typedef CUresult(__attribute__((sysv_abi)) *CUMODULELOAD_FN)(CUmodule*, const char*);
-typedef CUresult(__attribute__((sysv_abi)) *CUMODULEUNLOAD_FN)(CUmodule);
-typedef CUresult(__attribute__((sysv_abi)) *CUMODULEGETFUNCTION_FN)(CUfunction*, CUmodule, const char*);
-typedef CUresult(__attribute__((sysv_abi)) *CULAUNCHKERNEL_FN)(
+typedef CUresult(D4R_UNIX_ABI *CUINIT_FN)(unsigned int);
+typedef CUresult(D4R_UNIX_ABI *CUDEVICEGETCOUNT_FN)(int*);
+typedef CUresult(D4R_UNIX_ABI *CUDEVICEGET_FN)(CUdevice*, int);
+typedef CUresult(D4R_UNIX_ABI *CUCTXCREATE_FN)(CUcontext*, unsigned int, CUdevice);
+typedef CUresult(D4R_UNIX_ABI *CUDEVICEGETLUID_FN)(char*, unsigned int*, CUdevice);
+typedef CUresult(D4R_UNIX_ABI *CUDEVICEGETATTRIBUTE_FN)(int*, int, CUdevice);
+typedef CUresult(D4R_UNIX_ABI *CUDEVICEGETUUID_FN)(void*, CUdevice);
+typedef CUresult(D4R_UNIX_ABI *CUCTX_CURRENT_FN)(CUcontext);
+typedef CUresult(D4R_UNIX_ABI *CUCTX_POP_CURRENT_FN)(CUcontext*);
+typedef CUresult(D4R_UNIX_ABI *CUCTX_GET_DEVICE_FN)(CUdevice*);
+typedef CUresult(D4R_UNIX_ABI *CUCTXDESTROY_FN)(CUcontext);
+typedef CUresult(D4R_UNIX_ABI *CUCTX_SYNCHRONIZE_FN)(void);
+typedef CUresult(D4R_UNIX_ABI *CUMODULELOADDATA_FN)(CUmodule*, const void*);
+typedef CUresult(D4R_UNIX_ABI *CUMODULELOADDATAEX_FN)(CUmodule*, const void*, unsigned int, int*, void**);
+typedef CUresult(D4R_UNIX_ABI *CUMODULELOAD_FN)(CUmodule*, const char*);
+typedef CUresult(D4R_UNIX_ABI *CUMODULEUNLOAD_FN)(CUmodule);
+typedef CUresult(D4R_UNIX_ABI *CUMODULEGETFUNCTION_FN)(CUfunction*, CUmodule, const char*);
+typedef CUresult(D4R_UNIX_ABI *CULAUNCHKERNEL_FN)(
     CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int,
     unsigned int, CUstream, void**, void**);
-typedef CUresult(__attribute__((sysv_abi)) *CUEVENTCREATE_FN)(CUevent*, unsigned int);
-typedef CUresult(__attribute__((sysv_abi)) *CUEVENTRECORD_FN)(CUevent, CUstream);
-typedef CUresult(__attribute__((sysv_abi)) *CUEVENTELAPSED_FN)(float*, CUevent, CUevent);
-typedef CUresult(__attribute__((sysv_abi)) *CUEVENTDESTROY_FN)(CUevent);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMALLOC_FN)(CUdeviceptr*, size_t);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMFREE_FN)(CUdeviceptr);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMALLOCHOST_FN)(void**, size_t);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMFREEHOST_FN)(void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMCPY2D_FN)(const void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMCPYHTODASYNC_FN)(CUdeviceptr, const void*, size_t, CUstream);
-typedef CUresult(__attribute__((sysv_abi)) *CUMEMCPYDTOH_FN)(void*, CUdeviceptr, size_t);
-typedef CUresult(__attribute__((sysv_abi)) *CUARRAYCREATEV2_FN)(CUarray*, const void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUARRAY3DCREATEV2_FN)(CUarray*, const void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUARRAYDESTROY_FN)(CUarray);
-typedef CUresult(__attribute__((sysv_abi)) *CUARRAYGETDESCRIPTORV2_FN)(void*, CUarray);
-typedef CUresult(__attribute__((sysv_abi)) *CUMIPMAPPEDARRAYDESTROY_FN)(CUmipmappedArray);
-typedef CUresult(__attribute__((sysv_abi)) *CUEXTERNALMEMORYDESTROY_FN)(CUexternalMemory);
-typedef CUresult(__attribute__((sysv_abi)) *CUSURFOBJECTCREATE_FN)(CUsurfObject*, const void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUSURFOBJECTDESTROY_FN)(CUsurfObject);
-typedef CUresult(__attribute__((sysv_abi)) *CUSURFOBJECTGETDESC_FN)(void*, CUsurfObject);
-typedef CUresult(__attribute__((sysv_abi)) *CUTEXOBJECTCREATE_FN)(CUtexObject*, const void*, const void*, const void*);
-typedef CUresult(__attribute__((sysv_abi)) *CUTEXOBJECTDESTROY_FN)(CUtexObject);
-typedef CUresult(__attribute__((sysv_abi)) *CUTEXOBJECTGETDESC_FN)(void*, CUtexObject);
-typedef CUresult(__attribute__((sysv_abi)) *CUGETERRORSTRING_FN)(CUresult, const char**);
-typedef CUresult(__attribute__((sysv_abi)) *CUGETPROCADDRESS_FN)(const char*, void**, int, uint64_t, int*);
+typedef CUresult(D4R_UNIX_ABI *CUEVENTCREATE_FN)(CUevent*, unsigned int);
+typedef CUresult(D4R_UNIX_ABI *CUEVENTRECORD_FN)(CUevent, CUstream);
+typedef CUresult(D4R_UNIX_ABI *CUEVENTELAPSED_FN)(float*, CUevent, CUevent);
+typedef CUresult(D4R_UNIX_ABI *CUEVENTDESTROY_FN)(CUevent);
+typedef CUresult(D4R_UNIX_ABI *CUMEMALLOC_FN)(CUdeviceptr*, size_t);
+typedef CUresult(D4R_UNIX_ABI *CUMEMFREE_FN)(CUdeviceptr);
+typedef CUresult(D4R_UNIX_ABI *CUMEMALLOCHOST_FN)(void**, size_t);
+typedef CUresult(D4R_UNIX_ABI *CUMEMFREEHOST_FN)(void*);
+typedef CUresult(D4R_UNIX_ABI *CUMEMCPY2D_FN)(const void*);
+typedef CUresult(D4R_UNIX_ABI *CUMEMCPYHTODASYNC_FN)(CUdeviceptr, const void*, size_t, CUstream);
+typedef CUresult(D4R_UNIX_ABI *CUMEMCPYDTOH_FN)(void*, CUdeviceptr, size_t);
+typedef CUresult(D4R_UNIX_ABI *CUARRAYCREATEV2_FN)(CUarray*, const void*);
+typedef CUresult(D4R_UNIX_ABI *CUARRAY3DCREATEV2_FN)(CUarray*, const void*);
+typedef CUresult(D4R_UNIX_ABI *CUARRAYDESTROY_FN)(CUarray);
+typedef CUresult(D4R_UNIX_ABI *CUARRAYGETDESCRIPTORV2_FN)(void*, CUarray);
+typedef CUresult(D4R_UNIX_ABI *CUMIPMAPPEDARRAYDESTROY_FN)(CUmipmappedArray);
+typedef CUresult(D4R_UNIX_ABI *CUEXTERNALMEMORYDESTROY_FN)(CUexternalMemory);
+typedef CUresult(D4R_UNIX_ABI *CUSURFOBJECTCREATE_FN)(CUsurfObject*, const void*);
+typedef CUresult(D4R_UNIX_ABI *CUSURFOBJECTDESTROY_FN)(CUsurfObject);
+typedef CUresult(D4R_UNIX_ABI *CUSURFOBJECTGETDESC_FN)(void*, CUsurfObject);
+typedef CUresult(D4R_UNIX_ABI *CUTEXOBJECTCREATE_FN)(CUtexObject*, const void*, const void*, const void*);
+typedef CUresult(D4R_UNIX_ABI *CUTEXOBJECTDESTROY_FN)(CUtexObject);
+typedef CUresult(D4R_UNIX_ABI *CUTEXOBJECTGETDESC_FN)(void*, CUtexObject);
+typedef CUresult(D4R_UNIX_ABI *CUGETERRORSTRING_FN)(CUresult, const char**);
+typedef CUresult(D4R_UNIX_ABI *CUGETPROCADDRESS_FN)(const char*, void**, int, uint64_t, int*);
 
 static pthread_once_t context_once = PTHREAD_ONCE_INIT;
 static CUresult context_setup_result = CUDA_ERROR_NOT_INITIALIZED;
@@ -983,7 +1095,11 @@ static void create_default_zluda_context(void)
     }
 
     CUdevice device = 0;
+#ifdef D4R_NATIVE_WINDOWS
+    context_setup_result = get_device(&device, ngx_device() >= 0 ? ngx_device() : 0);
+#else
     context_setup_result = get_device(&device, 0);
+#endif
     if (context_setup_result == CUDA_SUCCESS)
         context_setup_result = create_context(&cuda_context, 0, device);
     if (context_setup_result != CUDA_SUCCESS)
@@ -1428,7 +1544,7 @@ static void summarize_resource(unsigned int sequence, const char* kernel, size_t
     DWORD length = GetEnvironmentVariableA("D4R_CUDA_LAUNCH_DUMP_DIR", dump_dir, sizeof(dump_dir));
     if (length == 0 || length >= sizeof(dump_dir))
         return;
-    mkdir(dump_dir, 0700);
+    d4r_mkdir(dump_dir);
     char filename[MAX_PATH];
     snprintf(filename, sizeof(filename), "%s/launch-%03u-%s-arg%03zu-%s-%s-fmt%d.bin", dump_dir,
              sequence, kernel, argument_offset, kind, shape, format);
@@ -1604,8 +1720,8 @@ static void replay_dump_launch(unsigned int sequence, CUfunction function_handle
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/replay-%06u-%s", directory, sequence, kernel);
-    mkdir(directory, 0700);
-    mkdir(path, 0700);
+    d4r_mkdir(directory);
+    d4r_mkdir(path);
     const unsigned char* arguments = (const unsigned char*)extra[1];
     const size_t argument_bytes = *(const size_t*)extra[3];
     char filename[1200];
@@ -1678,27 +1794,20 @@ static int launch_stats_enabled(void)
     return length > 0 && length < sizeof(value) && value[0] == '1';
 }
 
+/* D4R_CUDA_CAPTURE_DIR's default: /tmp on Linux, the user's cache folder on Windows */
+static void default_capture_dir(char* out, size_t size)
+{
+#ifdef D4R_NATIVE_WINDOWS
+    char base[1024];
+    snprintf(out, size, "%s/d4r-dlss-cuda-modules", d4r_user_cache_base(base, sizeof(base)));
+#else
+    snprintf(out, size, "/tmp/d4r-dlss-cuda-modules");
+#endif
+}
+
 static size_t readable_span(const void* address)
 {
-    FILE* maps = fopen("/proc/self/maps", "r");
-    if (maps == NULL)
-        return 0;
-    const uintptr_t target = (uintptr_t)address;
-    char line[512];
-    size_t span = 0;
-    while (fgets(line, sizeof(line), maps) != NULL)
-    {
-        unsigned long long begin = 0, end = 0;
-        char permissions[5] = {0};
-        if (sscanf(line, "%llx-%llx %4s", &begin, &end, permissions) == 3 &&
-            permissions[0] == 'r' && target >= begin && target < end)
-        {
-            span = (size_t)(end - target);
-            break;
-        }
-    }
-    fclose(maps);
-    return span;
+    return d4r_readable_span(address);
 }
 
 static void capture_ptx_if_present(const void* image, const char* api)
@@ -1735,15 +1844,15 @@ static void capture_ptx_if_present(const void* image, const char* api)
             char capture_dir[MAX_PATH] = {0};
             DWORD length = GetEnvironmentVariableA("D4R_CUDA_CAPTURE_DIR", capture_dir, sizeof(capture_dir));
             if (length == 0 || length >= sizeof(capture_dir))
-                strcpy(capture_dir, "/tmp/d4r-dlss-cuda-modules");
-            mkdir(capture_dir, 0700);
+                default_capture_dir(capture_dir, sizeof(capture_dir));
+            d4r_mkdir(capture_dir);
 
             pthread_mutex_lock(&trace_lock);
             const unsigned int sequence = ++capture_sequence;
             pthread_mutex_unlock(&trace_lock);
             char filename[MAX_PATH];
             snprintf(filename, sizeof(filename), "%s/dlss-module-%ld-%04u.fatbin",
-                     capture_dir, (long)getpid(), sequence);
+                     capture_dir, d4r_process_id(), sequence);
             FILE* output = fopen(filename, "wb");
             if (output == NULL)
                 tracef("%s saw CUDA fatbin v1 size=%zu but could not open %s", api, module_size, filename);
@@ -1799,14 +1908,14 @@ static void capture_ptx_if_present(const void* image, const char* api)
     char capture_dir[MAX_PATH] = {0};
     DWORD length = GetEnvironmentVariableA("D4R_CUDA_CAPTURE_DIR", capture_dir, sizeof(capture_dir));
     if (length == 0 || length >= sizeof(capture_dir))
-        strcpy(capture_dir, "/tmp/d4r-dlss-cuda-modules");
-    mkdir(capture_dir, 0700);
+        default_capture_dir(capture_dir, sizeof(capture_dir));
+    d4r_mkdir(capture_dir);
 
     pthread_mutex_lock(&trace_lock);
     const unsigned int sequence = ++capture_sequence;
     pthread_mutex_unlock(&trace_lock);
     char filename[MAX_PATH];
-    snprintf(filename, sizeof(filename), "%s/dlss-module-%ld-%04u.ptx", capture_dir, (long)getpid(), sequence);
+    snprintf(filename, sizeof(filename), "%s/dlss-module-%ld-%04u.ptx", capture_dir, d4r_process_id(), sequence);
     FILE* output = fopen(filename, "wb");
     if (output == NULL)
     {
@@ -1828,7 +1937,11 @@ static CUresult missing(const char* name)
 
 static void* bridge_export(const char* name)
 {
-    HMODULE module = GetModuleHandleA("nvcuda.dll");
+    static HMODULE module;
+    if (module == NULL &&
+        !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(void*)&bridge_export, &module))
+        module = GetModuleHandleA("nvcuda.dll");
     return module != NULL ? (void*)GetProcAddress(module, name) : NULL;
 }
 
@@ -1844,6 +1957,11 @@ CUresult WINAPI cuDeviceGetCount(int* count)
 {
     CUDEVICEGETCOUNT_FN function = (CUDEVICEGETCOUNT_FN)find_zluda_symbol("cuDeviceGetCount");
     CUresult result = function != NULL ? function(count) : CUDA_ERROR_NOT_INITIALIZED;
+#ifdef D4R_NATIVE_WINDOWS
+    /* one device: the GPU DLSS runs on (ngx_device) */
+    if (result == CUDA_SUCCESS && count != NULL && *count > 1 && ngx_device() >= 0)
+        *count = 1;
+#endif
     tracef("cuDeviceGetCount result=%d count=%d", result, count != NULL ? *count : -1);
     return result;
 }
@@ -1851,7 +1969,19 @@ CUresult WINAPI cuDeviceGetCount(int* count)
 CUresult WINAPI cuDeviceGet(CUdevice* device, int ordinal)
 {
     CUDEVICEGET_FN function = (CUDEVICEGET_FN)find_zluda_symbol("cuDeviceGet");
-    CUresult result = function != NULL ? function(device, ordinal) : CUDA_ERROR_NOT_INITIALIZED;
+    int hip_ordinal = ordinal;
+#ifdef D4R_NATIVE_WINDOWS
+    if (function != NULL && ngx_device() >= 0)
+    {
+        if (ordinal != 0)
+        {
+            tracef("cuDeviceGet ordinal=%d: NGX sees one device", ordinal);
+            return CUDA_ERROR_INVALID_DEVICE;
+        }
+        hip_ordinal = ngx_device();
+    }
+#endif
+    CUresult result = function != NULL ? function(device, hip_ordinal) : CUDA_ERROR_NOT_INITIALIZED;
     tracef("cuDeviceGet ordinal=%d result=%d device=%d", ordinal, result, device != NULL ? *device : -1);
     return result;
 }
@@ -2174,7 +2304,7 @@ CUresult WINAPI cuMemAllocHost(void** pointer, size_t bytes)
 {
     /* cuMemAllocHost is cuMemHostAlloc with no flags; ZLUDA implements only
        the latter (via hipHostMalloc). */
-    typedef CUresult(__attribute__((sysv_abi)) * host_alloc_type)(void**, size_t, unsigned int);
+    typedef CUresult(D4R_UNIX_ABI * host_alloc_type)(void**, size_t, unsigned int);
     host_alloc_type function = (host_alloc_type)find_zluda_symbol("cuMemHostAlloc");
     CUresult result = function != NULL ? function(pointer, bytes, 0) : missing("cuMemHostAlloc");
     TRACE_CALL(result, "cuMemAllocHost bytes=%zu result=%d host_ptr=%p", bytes, result,
@@ -2543,7 +2673,7 @@ typedef uintptr_t D4rArg;
 #define D4R_FORWARD(name, target, count, params, args) \
     CUresult WINAPI name params \
     { \
-        typedef CUresult(__attribute__((sysv_abi)) * function_type) params; \
+        typedef CUresult(D4R_UNIX_ABI * function_type) params; \
         function_type function = (function_type)find_zluda_symbol(#target); \
         CUresult result = function != NULL ? function args : missing(#target); \
         TRACE_CALL(result, #name "->" #target " result=%d", result); \
@@ -2556,7 +2686,7 @@ D4R_FORWARD(cuEventRecord, cuEventRecord, 2, (D4rArg a0, D4rArg a1), (a0, a1))
 D4R_FORWARD(cuEventRecordWithFlags, cuEventRecordWithFlags, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 CUresult WINAPI cuEventSynchronize(D4rArg a0)
 {
-    typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);
+    typedef CUresult(D4R_UNIX_ABI * function_type)(D4rArg);
     if (elide_ngx_sync())
     {
         TRACE_CALL(CUDA_SUCCESS, "cuEventSynchronize elided");
@@ -2571,7 +2701,7 @@ CUresult WINAPI cuEventSynchronize(D4rArg a0)
    game's split command list only after this event has actually completed. */
 CUresult WINAPI d4rEventSynchronize(D4rArg a0)
 {
-    typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);
+    typedef CUresult(D4R_UNIX_ABI * function_type)(D4rArg);
     function_type function = (function_type)find_zluda_symbol("cuEventSynchronize");
     CUresult result = function != NULL ? function(a0) : missing("cuEventSynchronize");
     if (result == CUDA_SUCCESS)
@@ -2583,7 +2713,7 @@ D4R_FORWARD(cuEventQuery, cuEventQuery, 1, (D4rArg a0), (a0))
 /* With elided event waits an event may still be pending: report 0 ms instead of CUDA_ERROR_NOT_READY. */
 CUresult WINAPI cuEventElapsedTime(D4rArg a0, D4rArg a1, D4rArg a2)
 {
-    typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg, D4rArg, D4rArg);
+    typedef CUresult(D4R_UNIX_ABI * function_type)(D4rArg, D4rArg, D4rArg);
     function_type function = (function_type)find_zluda_symbol("cuEventElapsedTime");
     CUresult result = function != NULL ? function(a0, a1, a2) : missing("cuEventElapsedTime");
     if (result == CUDA_ERROR_NOT_READY && elide_ngx_sync() && a0 != 0)
@@ -2702,26 +2832,54 @@ typedef struct
     int handleType; /* VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT = 1 */
 } D4rVkMemoryGetFdInfo;
 
-typedef int(__attribute__((sysv_abi)) * HIP_IMPORT_EXTERNAL_MEMORY_FN)(void**, const D4rHipExternalMemoryHandleDesc*);
-typedef int(__attribute__((sysv_abi)) * HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN)(void**, void*,
+typedef int(D4R_UNIX_ABI * HIP_IMPORT_EXTERNAL_MEMORY_FN)(void**, const D4rHipExternalMemoryHandleDesc*);
+typedef int(D4R_UNIX_ABI * HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN)(void**, void*,
                                                                                 const D4rHipExternalMemoryBufferDesc*);
-typedef int(__attribute__((sysv_abi)) * HIP_DESTROY_EXTERNAL_MEMORY_FN)(void*);
-typedef void*(__attribute__((sysv_abi)) * VK_GET_DEVICE_PROC_ADDR_FN)(void*, const char*);
-typedef int(__attribute__((sysv_abi)) * VK_GET_MEMORY_FD_FN)(void*, const D4rVkMemoryGetFdInfo*, int*);
+typedef int(D4R_UNIX_ABI * HIP_DESTROY_EXTERNAL_MEMORY_FN)(void*);
+typedef void*(D4R_UNIX_ABI * VK_GET_DEVICE_PROC_ADDR_FN)(void*, const char*);
+typedef int(D4R_UNIX_ABI * VK_GET_MEMORY_FD_FN)(void*, const D4rVkMemoryGetFdInfo*, int*);
 
 static void* hip_symbol(const char* name)
 {
     static void* hip;
+#ifdef D4R_NATIVE_WINDOWS
+    if (hip == NULL)
+        hip = dlopen("amdhip64_7.dll", RTLD_NOW | RTLD_NOLOAD);
+    if (hip == NULL)
+        hip = dlopen("amdhip64_6.dll", RTLD_NOW | RTLD_NOLOAD);
+#else
     if (hip == NULL)
         hip = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_NOLOAD);
     if (hip == NULL)
         hip = dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
+#endif
     return hip != NULL ? dlsym(hip, name) : NULL;
+}
+
+/* Raw HIP calls act on the calling thread's current HIP device, which is device 0 on a thread without a ZLUDA
+   context (the shim's helper threads); on Windows that can be an integrated GPU. The d4r helpers that use HIP
+   directly first select the GPU DLSS runs on. */
+static void bind_ngx_device(void)
+{
+#ifdef D4R_NATIVE_WINDOWS
+    typedef int (*HIP_SET_DEVICE_FN)(int);
+    static HIP_SET_DEVICE_FN set_device;
+    if (set_device == NULL)
+        set_device = (HIP_SET_DEVICE_FN)hip_symbol("hipSetDevice");
+    if (set_device != NULL && ngx_device() >= 0)
+        set_device(ngx_device());
+#endif
 }
 
 CUresult WINAPI d4rImportVulkanMemory(void* client_device, uint64_t client_memory, uint64_t bytes, CUdeviceptr* pointer,
                                       void** memory)
 {
+#ifdef D4R_NATIVE_WINDOWS
+    /* translates winevulkan handles; a native Windows game has no vkd3d-proton device to share */
+    (void)client_device, (void)client_memory, (void)bytes, (void)pointer, (void)memory;
+    tracef("d4rImportVulkanMemory: not available in the native Windows bridge");
+    return CUDA_ERROR_NOT_SUPPORTED;
+#else
     ensure_context();
     if (client_device == NULL || client_memory == 0 || pointer == NULL || memory == NULL)
         return CUDA_ERROR_INVALID_VALUE;
@@ -2797,6 +2955,7 @@ CUresult WINAPI d4rImportVulkanMemory(void* client_device, uint64_t client_memor
     tracef("d4rImportVulkanMemory: host memory 0x%llx -> fd %d -> device %p (%llu bytes)",
            (unsigned long long)host_memory, fd, device, (unsigned long long)bytes);
     return CUDA_SUCCESS;
+#endif
 }
 
 /* d4r: asynchronous 2D copy between device memory and arrays on the null stream (ZLUDA forwards
@@ -2852,6 +3011,7 @@ CUresult WINAPI d4rStreamWaitValue32(CUdeviceptr pointer, uint32_t value)
         function = (HIP_STREAM_WAIT_VALUE32_FN)hip_symbol("hipStreamWaitValue32");
     if (function == NULL)
         return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
     const int result = function(NULL, (void*)(uintptr_t)pointer, value, 0 /* hipStreamWaitValueGte */, 0xffffffffu);
     if (result != 0 || trace_verbose())
         tracef("d4rStreamWaitValue32 %p >= %u result=%d", (void*)(uintptr_t)pointer, value, result);
@@ -2870,6 +3030,7 @@ CUresult WINAPI d4rWriteValue32(CUdeviceptr pointer, uint32_t value)
     pthread_mutex_lock(&lock);
     if (stream == NULL)
     {
+        bind_ngx_device(); /* the stream belongs to the device current at its creation */
         HIP_STREAM_CREATE_WITH_FLAGS_FN create = (HIP_STREAM_CREATE_WITH_FLAGS_FN)hip_symbol("hipStreamCreateWithFlags");
         write = (HIP_STREAM_WRITE_VALUE32_FN)hip_symbol("hipStreamWriteValue32");
         sync = (HIP_STREAM_SYNCHRONIZE_FN)hip_symbol("hipStreamSynchronize");
@@ -2881,6 +3042,25 @@ CUresult WINAPI d4rWriteValue32(CUdeviceptr pointer, uint32_t value)
         result = sync(stream);
     pthread_mutex_unlock(&lock);
     tracef("d4rWriteValue32 %p = %u result=%d", (void*)(uintptr_t)pointer, value, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+}
+
+/* d4r: queues on the null stream, after everything queued before it (DLSS's output copy), a write of `value` to
+   the u32 at `pointer`: on native Windows the game's command list waits on the GPU for it (same-frame results). */
+CUresult WINAPI d4rStreamWriteValue32(CUdeviceptr pointer, uint32_t value)
+{
+    static HIP_STREAM_WRITE_VALUE32_FN function;
+    ensure_context();
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    if (function == NULL)
+        function = (HIP_STREAM_WRITE_VALUE32_FN)hip_symbol("hipStreamWriteValue32");
+    if (function == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
+    const int result = function(NULL, (void*)(uintptr_t)pointer, value, 0);
+    if (result != 0 || trace_verbose())
+        tracef("d4rStreamWriteValue32 %p = %u result=%d", (void*)(uintptr_t)pointer, value, result);
     return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
 
@@ -2914,5 +3094,179 @@ CUresult WINAPI d4rReleaseVulkanMemory(void* memory)
     HIP_DESTROY_EXTERNAL_MEMORY_FN destroy = (HIP_DESTROY_EXTERNAL_MEMORY_FN)hip_symbol("hipDestroyExternalMemory");
     const int result = destroy != NULL ? destroy(memory) : -1;
     tracef("d4rReleaseVulkanMemory: hipDestroyExternalMemory(%p) -> %d", memory, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+/* d4r: D3D12 interop for native Windows (tools/d3d12_native_interop_probe.cpp, docs/windows.md). AMD's D3D12
+   driver and HIP share VRAM through NT handles from ID3D12Device::CreateSharedHandle, as CUDA does with
+   NVIDIA's. HIP does not take ownership of a handle; the caller closes it.
+
+   d4rImportWin32Memory maps shared memory into the CUDA address space: `type` is a hipExternalMemoryHandleType,
+   5 (D3D12Resource) for a committed resource, whose allocation size `bytes` is, 4 (D3D12Heap) for a heap or
+   2 (OpaqueWin32). d4rReleaseVulkanMemory releases the import. */
+CUresult WINAPI d4rImportWin32Memory(void* handle, uint32_t type, uint64_t bytes, CUdeviceptr* pointer, void** memory)
+{
+    ensure_context();
+    if (handle == NULL || bytes == 0 || pointer == NULL || memory == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    bind_ngx_device();
+    HIP_IMPORT_EXTERNAL_MEMORY_FN import = (HIP_IMPORT_EXTERNAL_MEMORY_FN)hip_symbol("hipImportExternalMemory");
+    HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN map =
+        (HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN)hip_symbol("hipExternalMemoryGetMappedBuffer");
+    HIP_DESTROY_EXTERNAL_MEMORY_FN destroy = (HIP_DESTROY_EXTERNAL_MEMORY_FN)hip_symbol("hipDestroyExternalMemory");
+    if (import == NULL || map == NULL || destroy == NULL)
+    {
+        tracef("d4rImportWin32Memory: HIP has no external memory functions");
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    D4rHipExternalMemoryHandleDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.type = (int)type;
+    desc.handle.win32.handle = handle;
+    desc.size = bytes;
+    desc.flags = type == 5 ? 1 : 0; /* hipExternalMemoryDedicated, required for a D3D12 committed resource */
+    void* external = NULL;
+    int result = import(&external, &desc);
+    if (result != 0)
+    {
+        tracef("d4rImportWin32Memory: hipImportExternalMemory(type %u, handle %p, %llu bytes) failed: %d", type,
+               handle, (unsigned long long)bytes, result);
+        return result == 801 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+    }
+    D4rHipExternalMemoryBufferDesc buffer;
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.size = bytes;
+    void* device = NULL;
+    result = map(&device, external, &buffer);
+    if (result != 0)
+    {
+        tracef("d4rImportWin32Memory: hipExternalMemoryGetMappedBuffer failed: %d", result);
+        destroy(external);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *pointer = (CUdeviceptr)(uintptr_t)device;
+    *memory = external;
+    tracef("d4rImportWin32Memory: type %u handle %p -> device %p (%llu bytes)", type, handle, device,
+           (unsigned long long)bytes);
+    return CUDA_SUCCESS;
+}
+
+/* External semaphores: a D3D12 fence shared with HIP (`type` 4, hipExternalSemaphoreHandleTypeD3D12Fence) lets
+   the GPU order D3D12 and DLSS work without the CPU: the game's queue signals the fence when DLSS's inputs are
+   copied, DLSS's stream waits for that value, and signals another one that the game's queue waits for before
+   it reads the output. The waits and signals go on the null stream, where NGX runs. */
+typedef struct
+{
+    int type;
+    union
+    {
+        int fd;
+        struct
+        {
+            void* handle;
+            const void* name;
+        } win32;
+        const void* nvSciSyncObj;
+    } handle;
+    unsigned int flags;
+    unsigned int reserved[16];
+} D4rHipExternalSemaphoreHandleDesc;
+
+typedef struct
+{
+    struct
+    {
+        struct
+        {
+            unsigned long long value;
+        } fence;
+        union
+        {
+            void* fence;
+            unsigned long long reserved;
+        } nvSciSync;
+        struct
+        {
+            unsigned long long key;
+            unsigned int timeoutMs; /* wait parameters only; padding in the signal parameters */
+        } keyedMutex;
+        unsigned int reserved[10];
+    } params;
+    unsigned int flags;
+    unsigned int reserved[16];
+} D4rHipExternalSemaphoreParams;
+
+/* the layouts of HIP's hipExternalSemaphoreHandleDesc and hipExternalSemaphore{Signal,Wait}Params (x86-64) */
+_Static_assert(sizeof(D4rHipExternalSemaphoreHandleDesc) == 96, "hipExternalSemaphoreHandleDesc layout");
+_Static_assert(sizeof(D4rHipExternalSemaphoreParams) == 144, "hipExternalSemaphore*Params layout");
+_Static_assert(offsetof(D4rHipExternalSemaphoreParams, flags) == 72, "hipExternalSemaphore*Params layout");
+
+typedef int (*HIP_IMPORT_EXTERNAL_SEMAPHORE_FN)(void**, const D4rHipExternalSemaphoreHandleDesc*);
+typedef int (*HIP_EXTERNAL_SEMAPHORES_FN)(void* const*, const D4rHipExternalSemaphoreParams*, unsigned int, void*);
+typedef int (*HIP_DESTROY_EXTERNAL_SEMAPHORE_FN)(void*);
+
+CUresult WINAPI d4rImportWin32Semaphore(void* handle, uint32_t type, void** semaphore)
+{
+    ensure_context();
+    if (handle == NULL || semaphore == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    HIP_IMPORT_EXTERNAL_SEMAPHORE_FN import =
+        (HIP_IMPORT_EXTERNAL_SEMAPHORE_FN)hip_symbol("hipImportExternalSemaphore");
+    if (import == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
+    D4rHipExternalSemaphoreHandleDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.type = (int)type;
+    desc.handle.win32.handle = handle;
+    const int result = import(semaphore, &desc);
+    tracef("d4rImportWin32Semaphore: type %u handle %p -> %p, result %d", type, handle,
+           result == 0 ? *semaphore : NULL, result);
+    return result == 0 ? CUDA_SUCCESS : result == 801 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+}
+
+static CUresult external_semaphore(const char* function_name, void* semaphore, uint64_t value)
+{
+    ensure_context();
+    if (semaphore == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    HIP_EXTERNAL_SEMAPHORES_FN function = (HIP_EXTERNAL_SEMAPHORES_FN)hip_symbol(function_name);
+    if (function == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    bind_ngx_device();
+    D4rHipExternalSemaphoreParams params;
+    memset(&params, 0, sizeof(params));
+    params.params.fence.value = value;
+    void* const semaphores[1] = {semaphore};
+    const int result = function(semaphores, &params, 1, NULL);
+    if (result != 0 || trace_verbose())
+        tracef("%s(%p, %llu) result=%d", function_name, semaphore, (unsigned long long)value, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+/* queues on the null stream a wait until the shared fence reaches `value` */
+CUresult WINAPI d4rWaitSemaphore(void* semaphore, uint64_t value)
+{
+    return external_semaphore("hipWaitExternalSemaphoresAsync", semaphore, value);
+}
+
+/* queues on the null stream a signal of the shared fence to `value` */
+CUresult WINAPI d4rSignalSemaphore(void* semaphore, uint64_t value)
+{
+    return external_semaphore("hipSignalExternalSemaphoresAsync", semaphore, value);
+}
+
+CUresult WINAPI d4rReleaseSemaphore(void* semaphore)
+{
+    HIP_DESTROY_EXTERNAL_SEMAPHORE_FN destroy =
+        (HIP_DESTROY_EXTERNAL_SEMAPHORE_FN)hip_symbol("hipDestroyExternalSemaphore");
+    const int result = destroy != NULL && semaphore != NULL ? destroy(semaphore) : -1;
+    tracef("d4rReleaseSemaphore: hipDestroyExternalSemaphore(%p) -> %d", semaphore, result);
     return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }

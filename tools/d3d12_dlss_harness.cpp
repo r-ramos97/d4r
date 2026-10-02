@@ -9,6 +9,8 @@
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
+#include <dxgi1_4.h>
 
 #include <algorithm>
 #include <array>
@@ -45,6 +47,33 @@ using PFN_Release = NgxResult (*)(NgxHandle*);
 using PFN_Shutdown = NgxResult (*)();
 
 static ID3D12Device* g_device;
+static ID3D12InfoQueue* g_infoQueue; // D4R_HARNESS_D3D12_DEBUG=1
+
+// The D3D12 debug layer's errors so far, printed; their number.
+static int report_d3d12_errors()
+{
+    if (g_infoQueue == nullptr)
+        return 0;
+    int errors = 0;
+    const UINT64 count = g_infoQueue->GetNumStoredMessages();
+    for (UINT64 index = 0; index < count; ++index)
+    {
+        SIZE_T length = 0;
+        g_infoQueue->GetMessage(index, nullptr, &length);
+        std::vector<uint8_t> storage(length);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(g_infoQueue->GetMessage(index, message, &length)))
+            continue;
+        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+        {
+            ++errors;
+            std::printf("D3D12 debug error: %.*s\n", static_cast<int>(message->DescriptionByteLength),
+                        message->pDescription);
+        }
+    }
+    g_infoQueue->ClearStoredMessages();
+    return errors;
+}
 static ID3D12CommandQueue* g_queue;
 static ID3D12CommandAllocator* g_allocator;
 static ID3D12GraphicsCommandList* g_list;
@@ -189,6 +218,58 @@ static void update_texture(ID3D12Resource* texture, const void* data, UINT rowBy
     barrier(texture, currentState, D3D12_RESOURCE_STATE_COPY_DEST);
     submit_and_wait();
     upload(texture, data, rowBytes, currentState);
+}
+
+// A viewable copy of the output: OUTPUT_RAW.bmp, 8-bit sRGB-ish (clamped, gamma 2.2) from RGBA16F or RGBA8.
+static void write_bmp_preview(const std::string& path, const std::vector<uint8_t>& pixels, UINT width, UINT height,
+                              bool rgba8)
+{
+    auto half = [](uint16_t bits) {
+        const uint32_t sign = (bits & 0x8000u) << 16, exponent = (bits >> 10) & 0x1f, mantissa = bits & 0x3ff;
+        uint32_t value;
+        if (exponent == 0)
+            value = mantissa == 0 ? sign : std::bit_cast<uint32_t>(std::ldexp(static_cast<float>(mantissa), -24)) | sign;
+        else if (exponent == 31)
+            value = sign | 0x7f800000u | (mantissa << 13);
+        else
+            value = sign | ((exponent + 112) << 23) | (mantissa << 13);
+        return std::bit_cast<float>(value);
+    };
+    const UINT stride = (width * 3 + 3) & ~3u;
+    std::vector<uint8_t> bmp(54 + static_cast<size_t>(stride) * height, 0);
+    auto put32 = [&](size_t offset, uint32_t value) { std::memcpy(bmp.data() + offset, &value, 4); };
+    bmp[0] = 'B', bmp[1] = 'M';
+    put32(2, static_cast<uint32_t>(bmp.size()));
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, width);
+    put32(22, height);
+    bmp[26] = 1, bmp[28] = 24;
+    put32(34, static_cast<uint32_t>(bmp.size() - 54));
+    for (UINT y = 0; y < height; ++y)
+        for (UINT x = 0; x < width; ++x)
+            for (int c = 0; c < 3; ++c)
+            {
+                float value;
+                if (rgba8)
+                    value = pixels[(static_cast<size_t>(y) * width + x) * 4 + c] / 255.0f;
+                else
+                {
+                    uint16_t bits;
+                    std::memcpy(&bits, pixels.data() + (static_cast<size_t>(y) * width + x) * 8 + c * 2, 2);
+                    value = std::pow(std::clamp(half(bits), 0.0f, 1.0f), 1.0f / 2.2f);
+                }
+                if (!(value >= 0.0f))
+                    value = 0.0f;
+                // BMP rows run bottom-up, pixels as BGR
+                bmp[54 + static_cast<size_t>(height - 1 - y) * stride + x * 3 + (2 - c)] =
+                    static_cast<uint8_t>(std::lround(std::min(value, 1.0f) * 255.0f));
+            }
+    if (FILE* file = std::fopen(path.c_str(), "wb"))
+    {
+        std::fwrite(bmp.data(), 1, bmp.size(), file);
+        std::fclose(file);
+    }
 }
 
 static std::vector<uint8_t> read_back(ID3D12Resource* texture, D3D12_RESOURCE_STATES state, UINT rowBytes)
@@ -446,10 +527,42 @@ int main(int argc, char** argv)
     HMODULE d3d12 = LoadLibraryA("d3d12.dll");
     auto createDevice = reinterpret_cast<HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**)>(
         reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")));
+    // D4R_HARNESS_D3D12_DEBUG=1: the D3D12 debug layer, whose errors fail the run (exit code 4)
+    const bool debugLayer = std::getenv("D4R_HARNESS_D3D12_DEBUG") != nullptr;
+    if (debugLayer)
+    {
+        auto getDebug = reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12GetDebugInterface")));
+        ID3D12Debug* debug = nullptr;
+        if (getDebug != nullptr && SUCCEEDED(getDebug(__uuidof(ID3D12Debug), reinterpret_cast<void**>(&debug))))
+        {
+            debug->EnableDebugLayer();
+            debug->Release();
+            std::printf("D3D12 debug layer enabled\n");
+        }
+        else
+            std::printf("D3D12 debug layer unavailable (Graphics Tools not installed)\n");
+    }
+    // D4R_HARNESS_ADAPTER=warp: Windows' software renderer (tests on machines without a GPU)
+    IDXGIAdapter* adapter = nullptr;
+    if (const char* choice = std::getenv("D4R_HARNESS_ADAPTER"); choice != nullptr && std::strcmp(choice, "warp") == 0)
+    {
+        HMODULE dxgi = LoadLibraryA("dxgi.dll");
+        auto createFactory = reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+        IDXGIFactory4* factory = nullptr;
+        if (createFactory == nullptr ||
+            !check(createFactory(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)), "CreateDXGIFactory1") ||
+            !check(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&adapter)), "EnumWarpAdapter"))
+            return 1;
+        factory->Release();
+    }
     if (createDevice == nullptr ||
-        !check(createDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&g_device)),
+        !check(createDevice(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&g_device)),
                "D3D12CreateDevice"))
         return 1;
+    if (debugLayer && SUCCEEDED(g_device->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void**>(&g_infoQueue))))
+        g_infoQueue->SetMuteDebugOutput(TRUE);
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(g_device->CreateCommandQueue(&queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&g_queue)),
@@ -884,6 +997,8 @@ int main(int argc, char** argv)
     for (uint8_t value : output)
         nonzero += value != 0;
     std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
+    write_bmp_preview(std::string(argv[2]) + ".bmp", output, outWidth, outHeight, rgba8);
+    std::printf("preview: %s.bmp\n", argv[2]);
 
     // D4R_HARNESS_RECREATE=N: N more release/create cycles at alternating render sizes (as when a game's DLSS
     // quality setting changes), a few evaluations each, logging this process's VRAM to find leaks per cycle.
@@ -931,5 +1046,8 @@ int main(int argc, char** argv)
 
     release(feature);
     shutdown();
-    return 0;
+    const int errors = report_d3d12_errors();
+    if (g_infoQueue != nullptr)
+        std::printf("D3D12 debug layer: %d error(s)\n", errors);
+    return errors != 0 ? 4 : 0;
 }

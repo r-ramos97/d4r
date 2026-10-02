@@ -1,0 +1,16 @@
+# OptiScaler.ini values d4r needs on native Windows (Section.Key=Value); everything else keeps OptiScaler's
+# default. d4r\setup.ps1 applies them (as d4r\optiscaler-d4r.settings).
+# DLSS as the DX12 upscaler, loaded from the d4r folder (OptiScaler looks for nvngx.dll there)
+Upscalers.Dx12Upscaler=dlss
+DLSS.Enabled=true
+Libraries.OptiDllPath=d4r
+# The game's DLSS calls reach OptiScaler; d4r's own load of NVIDIA's NGX core is left alone
+Inputs.EnableDlssInputs=true
+Hooks.HookOriginalNvngxOnly=true
+# d4r's nvapi64.dll in the game folder reports the NVIDIA GPU; not OptiScaler's fakenvapi
+NvApi.OverrideNvapiDll=false
+# The game sees an NVIDIA GPU through DXGI, so it offers DLSS
+Spoofing.Dxgi=true
+FrameGen.Enabled=false
+FrameGen.FGInput=nofg
+FrameGen.FGOutput=nofg

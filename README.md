@@ -1,5 +1,10 @@
 # d4r (dlss 4 radeon)
 
+> **Use the official Windows port instead.** This `windows-native` branch is an independent, unvalidated
+> alternative, written before the upstream project gained its own native Windows backend: the
+> [`windows` branch of countervolts/d4r](https://github.com/countervolts/d4r/tree/windows), validated on an
+> RX 9070 XT. This branch is kept for reference only; it has never run on a real AMD GPU.
+
 d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest DLSS kernels replaced by hand-written RDNA3 and RDNA4 code.
 
 **Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M). DLSS 5 is PURPOSELY not supported.
@@ -50,6 +55,16 @@ d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and
 | RDNA2 and older | | | unsupported |
 
 Native network kernels are built for all listed gfx11/gfx12 targets. Texture kernels are compiled for each target by `d4r_emit` when supplied to the package script; RDNA4 also has a `-fp8` variant. The bridge selects the KFD GPU with the most SIMDs, avoiding an integrated GPU when a discrete GPU is present; `D4R_GPU_ARCH` overrides that choice. Missing native kernels fall back to ZLUDA and can be much slower. Earlier translated K layers produced invalid values; preserving FP16 denormal handling fixes that failure in recorded captures, but RTX image-quality parity remains unverified. Preset E does not use the native network kernels.
+
+## Windows (preview)
+
+A native Windows build is in progress on the `windows-native` branch: the same shim, the nvcuda bridge built
+as a Windows DLL, ZLUDA on AMD's HIP SDK and an NVAPI that reports an Ada GPU, without Linux or Proton. DLSS's
+inputs and output stay in VRAM through D3D12 buffers shared with HIP (formats other than DLSS's own are
+converted by compute shaders), and `FrameAge = 0` shows each frame's own result through a GPU-side wait in the
+game's command list (experimental; the default shows the newest finished result, one frame old). It is built in
+CI and tested against mock libraries, on a Windows runner's software D3D12 renderer too, but has not run on an
+AMD GPU yet: `d4r\test-dlss.ps1` checks a PC first. See [docs/windows.md](docs/windows.md).
 
 ## How it works
 

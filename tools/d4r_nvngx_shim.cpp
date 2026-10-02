@@ -38,6 +38,8 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <vulkan/vulkan_core.h>
+#include "d4r_d3d12_convert.h"
+#include "d4r_d3d12_inline.h"
 
 #include <algorithm>
 #include <bit>
@@ -236,6 +238,8 @@ struct CudaApi
     // Optional (d4r nvcuda bridge): null-stream wait for a device u32, and a write from another stream.
     int(WINAPI* streamWaitValue32)(CudaDevicePtr, uint32_t) = nullptr;
     int(WINAPI* writeValue32)(CudaDevicePtr, uint32_t) = nullptr;
+    // Optional (d4r nvcuda bridge): a u32 write queued on the null stream (native Windows same-frame results).
+    int(WINAPI* streamWriteValue32)(CudaDevicePtr, uint32_t) = nullptr;
     // Optional (d4r nvcuda bridge): surfaces of an array store to linear memory instead (d4r native kernels).
     int(WINAPI* setArrayRedirect)(CudaArray, CudaDevicePtr, uint32_t) = nullptr;
     int(WINAPI* outputKernelNative)() = nullptr;
@@ -278,8 +282,11 @@ static HMODULE g_selfModule = nullptr;
 struct PortableInstall
 {
     bool active = false;
+    bool wine = true;                                         // Proton; false: native Windows (docs/windows.md)
     std::wstring dir;                                         // the d4r folder
-    std::string unixDir;                                      // the same folder as a Linux path
+    std::string unixDir;                                      // the same folder as a Linux path (Wine)
+    std::string bridgeDir;                                    // the folder as the bridge reads it: unixDir, or
+                                                              // the Windows path on native Windows
     std::vector<std::pair<std::string, std::string>> unixEnv; // for the bridge's d4rSetEnv
     std::vector<std::string> notes;                           // logged once the log is open
 };
@@ -407,6 +414,35 @@ static std::string unix_path(const std::wstring& path)
     return text;
 }
 
+// Proton or native Windows. Under Wine, ZLUDA and ROCm run on the Linux side behind the Wine nvcuda bridge
+// and take Linux paths; on native Windows the bridge, ZLUDA and HIP are Windows DLLs in this process.
+// D4R_PLATFORM=windows or =wine overrides the check (the tests run the Windows mode under Wine).
+static bool running_under_wine()
+{
+    static const bool wine = [] {
+        char platform[16] = {};
+        const DWORD length = GetEnvironmentVariableA("D4R_PLATFORM", platform, sizeof(platform));
+        if (length > 0 && length < sizeof(platform))
+            return _stricmp(platform, "wine") == 0;
+        return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    }();
+    return wine;
+}
+
+// A Windows path for the native bridge, which opens files through the C runtime (the ANSI code page); ""
+// when the path has characters that code page lacks.
+static std::string narrow_path(const std::wstring& path)
+{
+    BOOL lossy = FALSE;
+    const int length = WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, &lossy);
+    if (length <= 0 || lossy)
+        return std::string();
+    std::string text(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, text.data(), length, nullptr, nullptr);
+    text.resize(static_cast<size_t>(length - 1));
+    return text;
+}
+
 static std::wstring widen(const std::string& text)
 {
     std::wstring wide(text.size() + 1, L'\0');
@@ -480,9 +516,15 @@ static void load_portable_config()
     const std::vector<IniEntry> ini = parse_ini(text);
     g_portable.active = true;
     g_portable.dir = dir;
-    g_portable.unixDir = unix_path(dir);
-    if (g_portable.unixDir.empty())
-        g_portable.notes.push_back("cannot map the d4r folder to a Linux path (not running under Wine?)");
+    g_portable.wine = running_under_wine();
+    g_portable.unixDir = g_portable.wine ? unix_path(dir) : std::string();
+    g_portable.bridgeDir = g_portable.wine ? g_portable.unixDir : narrow_path(dir);
+    if (g_portable.bridgeDir.empty())
+        g_portable.notes.push_back(g_portable.wine
+                                       ? "cannot map the d4r folder to a Linux path (not running under Wine?)"
+                                       : "the d4r folder's path has characters this system's code page lacks; "
+                                         "move the game to a folder whose path has none");
+    const char* separator = g_portable.wine ? "/" : "\\";
 
     // Files of the install; NGX looks for nvngx_dlss.dll next to this DLL.
     portable_set(L"D4R_NVCUDA_BRIDGE", dir + L"\\nvcuda.dll");
@@ -494,16 +536,37 @@ static void load_portable_config()
     portable_set(L"D4R_SHIM_LOG", log.empty() ? dir + L"\\d4r_nvngx.log" : portable_path(log));
     portable_set("D4R_CUDA_CAPTURE", "0"); // the bridge would otherwise save every DLSS module it loads
 
+    // ZLUDA: libcuda.so on Linux; on Windows its nvcuda.dll, renamed so that NGX's LoadLibrary("nvcuda.dll")
+    // keeps finding the bridge
     const std::string zluda = ini_value(ini, "paths", "ZludaDir");
-    portable_set_unix("D4R_ZLUDA_LIBCUDA", (zluda.empty() ? g_portable.unixDir + "/zluda" : zluda) + "/libcuda.so");
-    // The release's bundled ROCm runtime unless d4r.ini names another
+    if (g_portable.wine)
+        portable_set_unix("D4R_ZLUDA_LIBCUDA", (zluda.empty() ? g_portable.unixDir + "/zluda" : zluda) + "/libcuda.so");
+    else if (!g_portable.bridgeDir.empty())
+        portable_set_unix("D4R_ZLUDA_LIBCUDA",
+                          (zluda.empty() ? g_portable.bridgeDir + "\\zluda" : narrow_path(portable_path(zluda))) +
+                              "\\zluda_nvcuda.dll");
+    // The release's bundled ROCm (Linux) or HIP (Windows) runtime unless d4r.ini names another; on Windows
+    // the bridge otherwise uses the HIP SDK's HIP_PATH, then the driver's copy.
     const std::string rocm = ini_value(ini, "paths", "RocmDir");
     if (!rocm.empty())
-        portable_set_unix("D4R_ROCM_DIR", rocm);
-    else if (!g_portable.unixDir.empty() && GetFileAttributesW((dir + L"\\rocm\\lib").c_str()) != INVALID_FILE_ATTRIBUTES)
-        portable_set_unix("D4R_ROCM_DIR", g_portable.unixDir + "/rocm");
+        portable_set_unix("D4R_ROCM_DIR", g_portable.wine ? rocm : narrow_path(portable_path(rocm)));
+    else if (!g_portable.bridgeDir.empty() &&
+             GetFileAttributesW((dir + (g_portable.wine ? L"\\rocm\\lib" : L"\\rocm\\bin")).c_str()) !=
+                 INVALID_FILE_ATTRIBUTES)
+        portable_set_unix("D4R_ROCM_DIR", g_portable.bridgeDir + separator + "rocm");
+    // Where the bridge serves verified native kernels from (and ZLUDA keeps its cache, on Linux)
     const std::string cache = ini_value(ini, "paths", "CacheDir");
-    portable_set_unix("D4R_ZLUDA_CACHE_HOME", cache.empty() ? "~/.cache/d4r" : cache);
+    if (g_portable.wine)
+        portable_set_unix("D4R_ZLUDA_CACHE_HOME", cache.empty() ? "~/.cache/d4r" : cache);
+    else
+    {
+        wchar_t local[MAX_PATH] = {};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+        const std::wstring base = length > 0 && length < MAX_PATH ? std::wstring(local) : g_portable.dir;
+        const std::string home = narrow_path(cache.empty() ? base + L"\\d4r" : portable_path(cache));
+        if (!home.empty())
+            portable_set_unix("D4R_ZLUDA_CACHE_HOME", home);
+    }
 
     std::string model = ini_value(ini, "dlss", "Model");
     if (ascii_lower(model) != "game")
@@ -534,8 +597,8 @@ static void load_portable_config()
     const bool nativeOn = native.empty() || native == "on" || native == "true" || native == "1" || native == "fast";
     if (!nativeOn && native != "off" && native != "false" && native != "0")
         g_portable.notes.push_back("d4r.ini: [Kernels] NativeKernels must be on or off, not '" + native + "'");
-    if (nativeOn && !g_portable.unixDir.empty())
-        portable_set_unix("D4R_ZLUDA_NATIVE_DIR", g_portable.unixDir + "/kernels");
+    if (nativeOn && !g_portable.bridgeDir.empty())
+        portable_set_unix("D4R_ZLUDA_NATIVE_DIR", g_portable.bridgeDir + separator + "kernels");
     portable_set_unix("D4R_ZLUDA_WMMA", ini_flag(ini, "kernels", "Wmma", 1) ? "1" : "0");
     portable_set_unix("D4R_ZLUDA_WMMA_FP8", ini_flag(ini, "kernels", "Fp8Wmma", 1) ? "1" : "0");
     // RDNA4's native FP8 WMMA; ZLUDA and the bridge ignore it on other GPUs
@@ -1234,6 +1297,21 @@ static bool load_libraries()
                          getenv(name.c_str()) != nullptr && value != getenv(name.c_str()) ? " (set by the environment)" : "");
         }
     }
+    // On native Windows NGX reads the GPU's architecture through NVAPI, which an AMD PC lacks: d4r's
+    // nvapi64.dll in the game folder (or the d4r folder) answers it. OptiScaler usually loaded it already;
+    // otherwise (the D3D12 harness, or OptiScaler with its NVAPI override) it is loaded here, before the core.
+    if (g_portable.active && !g_portable.wine)
+    {
+        HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+        for (const wchar_t* candidate : {L"\\..\\nvapi64.dll", L"\\nvapi64.dll"})
+            if (nvapi == nullptr && file_exists(g_portable.dir + candidate))
+                nvapi = LoadLibraryW((g_portable.dir + candidate).c_str());
+        wchar_t nvapiPath[MAX_PATH] = L"none";
+        if (nvapi != nullptr)
+            GetModuleFileNameW(nvapi, nvapiPath, MAX_PATH);
+        logf("NVAPI for NGX: %ls%s", nvapiPath,
+             nvapi == nullptr ? " (put d4r's nvapi64.dll in the game folder: NGX needs an Ada GPU identity)" : "");
+    }
     wchar_t corePath[MAX_PATH] = {};
     length = GetEnvironmentVariableW(L"D4R_NGX_CORE", corePath, MAX_PATH);
     if (length == 0 || length >= MAX_PATH)
@@ -1299,6 +1377,8 @@ static bool load_libraries()
     if (!load_export(g.cuda, "d4rStreamWaitValue32", g.cu.streamWaitValue32) ||
         !load_export(g.cuda, "d4rWriteValue32", g.cu.writeValue32))
         g.cu.streamWaitValue32 = nullptr, g.cu.writeValue32 = nullptr;
+    if (!load_export(g.cuda, "d4rStreamWriteValue32", g.cu.streamWriteValue32))
+        g.cu.streamWriteValue32 = nullptr;
     if (!load_export(g.cuda, "d4rSetArrayRedirect", g.cu.setArrayRedirect))
         g.cu.setArrayRedirect = nullptr;
     if (!load_export(g.cuda, "d4rOutputKernelNative", g.cu.outputKernelNative))
@@ -1349,8 +1429,11 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     ensure_portable_config();
     if (g_portable.active && !g.core)
     {
-        logf("portable install in %ls (settings from d4r.ini, Linux path %s)", g_portable.dir.c_str(),
-             g_portable.unixDir.c_str());
+        if (g_portable.wine)
+            logf("portable install in %ls (settings from d4r.ini, Linux path %s)", g_portable.dir.c_str(),
+                 g_portable.unixDir.c_str());
+        else
+            logf("portable install in %ls (settings from d4r.ini, native Windows)", g_portable.dir.c_str());
         for (const std::string& note : g_portable.notes)
             logf("d4r: %s", note.c_str());
     }
@@ -1431,6 +1514,7 @@ constexpr int kSlots = 3;
 // One more result slot than input slots: a slot is reused only once the GPU
 // is past every command list that copies from it (see claim_output_slot).
 constexpr int kOutputSlots = kSlots + 1;
+static_assert(kOutputSlots == d4r_inline::kSlots, "the same-frame wait shader reads every output slot");
 
 // A VkBuffer in device-local memory on vkd3d-proton's VkDevice, exported to
 // the CUDA side (see "VRAM interop").
@@ -1438,6 +1522,7 @@ struct VramBuffer
 {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    ID3D12Resource* d3d12 = nullptr; // native Windows: a shared D3D12 buffer instead of the Vulkan one
     CudaDevicePtr device = 0;
     void* external = nullptr;
     size_t bytes = 0;
@@ -1595,6 +1680,12 @@ struct Feature
     // the frame marker before any DLSS work is queued.
     bool gpuWait = false;
     VramBuffer gpuMarker;
+    // Native Windows split frames (tools/d4r_d3d12_inline.h): instead of splitting the command list, it waits on
+    // the GPU for inlineStatus (released frame, frame held by each output slot), which HIP writes after DLSS, and
+    // copies the newest result into inlinePresent, and from there into the game's output.
+    VramBuffer inlineStatus, inlinePresent;
+    // Waits that ended without their frame's result (spin limit, watchdog): a few switch the wait off.
+    std::atomic<int> inlineTimeouts{0};
     // Frame the null stream currently waits for (0: none) and since when; the watchdog releases a wait for a
     // frame whose command list never reaches the GPU (e.g. recorded but not executed), so DLSS cannot stall.
     std::atomic<uint32_t> gpuWaitFrame{0};
@@ -2001,6 +2092,12 @@ static uint32_t plane_channels(Plane plane)
 // nvcuda bridge (d4rImportVulkanMemory) maps those buffers into CUDA. The
 // worker then only moves data between them and the CUDA arrays on the GPU.
 // Frames whose formats do not qualify use the readback/upload path.
+//
+// On native Windows (AMD's D3D12 driver, no vkd3d-proton) the buffers are D3D12 committed buffers created
+// shared (CreateSharedHandle), which the native bridge maps into CUDA through HIP (d4rImportWin32Memory), and
+// the copies are D3D12 CopyTextureRegion calls on the game's command list. D3D12 has no blit, so only
+// resources already in the canonical formats qualify; rows are 256-byte aligned, as D3D12's buffer footprints
+// require. Whether the driver supports the import is tried once, with a small buffer.
 
 MIDL_INTERFACE("39da4e09-bd1c-4198-9fae-86bbe3be41fd")
 ID3D12DXVKInteropDevice : public IUnknown
@@ -2080,8 +2177,196 @@ struct VulkanInterop
     PFN_vkSignalSemaphore signalSemaphore = nullptr;
     int(WINAPI* import)(VkDevice, uint64_t, uint64_t, CudaDevicePtr*, void**) = nullptr;
     int(WINAPI* release)(void*) = nullptr;
+    // native Windows: D3D12 shared buffers (see above)
+    bool native = false;
+    int(WINAPI* importWin32)(void*, uint32_t, uint64_t, CudaDevicePtr*, void**) = nullptr;
 };
 static VulkanInterop g_vk;
+
+static bool create_vram_buffer(VramBuffer& target, size_t bytes);
+static void recycle_vram_buffer(VramBuffer& buffer);
+static void destroy_vram_buffer(VramBuffer& buffer);
+
+// Native Windows, game thread, once: whether D3D12 and HIP really see the same bytes of a shared buffer, both
+// ways, through the same kind of copies the frames use (on a direct queue of the game's device, and HIP copies on
+// the worker). A driver could import the handle yet map other memory; the game would then show black or stale
+// frames, so the VRAM path is taken only when the bytes cross. On failure `why` says what went wrong.
+static bool native_round_trip(const VramBuffer& probe, std::string& why)
+{
+    constexpr UINT64 kBytes = 4096;
+    std::vector<uint32_t> toHip(kBytes / 4), fromHip(kBytes / 4), seen(kBytes / 4);
+    for (size_t index = 0; index < toHip.size(); ++index)
+    {
+        toHip[index] = 0xd4a00000u ^ static_cast<uint32_t>(index * 2654435761u);
+        fromHip[index] = 0x5eed0000u ^ static_cast<uint32_t>(index * 40503u + 7u);
+    }
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    ID3D12Resource *upload = nullptr, *readback = nullptr;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    auto buffer = [](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, ID3D12Resource** resource) {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = type;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = kBytes;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                 __uuidof(ID3D12Resource), reinterpret_cast<void**>(resource));
+    };
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    HRESULT hr = event != nullptr ? S_OK : E_OUTOFMEMORY;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandQueue(&queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                              reinterpret_cast<void**>(&allocator));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                         __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&list));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
+    if (SUCCEEDED(hr))
+        hr = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &upload);
+    if (SUCCEEDED(hr))
+        hr = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, &readback);
+    void* mapped = nullptr;
+    if (SUCCEEDED(hr))
+        hr = upload->Map(0, nullptr, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        std::memcpy(mapped, toHip.data(), kBytes);
+        upload->Unmap(0, nullptr);
+    }
+    // the copies promote the shared buffer from COMMON implicitly; it decays back when the list completes
+    auto run = [&](ID3D12Resource* destination, ID3D12Resource* source, UINT64 value) {
+        HRESULT result = value == 1 ? S_OK : allocator->Reset();
+        if (SUCCEEDED(result) && value != 1)
+            result = list->Reset(allocator, nullptr);
+        if (FAILED(result))
+            return result;
+        list->CopyBufferRegion(destination, 0, source, 0, kBytes);
+        result = list->Close();
+        if (FAILED(result))
+            return result;
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        result = queue->Signal(fence, value);
+        if (SUCCEEDED(result))
+            result = fence->SetEventOnCompletion(value, event);
+        if (SUCCEEDED(result) && WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
+            result = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        return result;
+    };
+    char text[160] = "";
+    bool ok = false;
+    if (FAILED(hr))
+        std::snprintf(text, sizeof(text), "D3D12 setup failed (0x%08lx)", static_cast<unsigned long>(hr));
+    else if (FAILED(hr = run(probe.d3d12, upload, 1)))
+        std::snprintf(text, sizeof(text), "the D3D12 copy into the shared buffer failed (0x%08lx)",
+                      static_cast<unsigned long>(hr));
+    else
+    {
+        // D3D12 -> HIP, then HIP -> D3D12, with synchronous copies on the worker, which owns the context
+        const int copied = g.worker.call([&] {
+            CudaMemcpy2D copy = {};
+            copy.srcMemoryType = CUDA_MEMORY_DEVICE;
+            copy.srcDevice = probe.device;
+            copy.srcPitch = kBytes;
+            copy.dstMemoryType = CUDA_MEMORY_HOST;
+            copy.dstHost = seen.data();
+            copy.dstPitch = kBytes;
+            copy.WidthInBytes = kBytes;
+            copy.Height = 1;
+            int result = g.cu.memcpy2D(&copy);
+            if (result != 0)
+                return 100 + result;
+            if (std::memcmp(seen.data(), toHip.data(), kBytes) != 0)
+                return 1;
+            copy = {};
+            copy.srcMemoryType = CUDA_MEMORY_HOST;
+            copy.srcHost = fromHip.data();
+            copy.srcPitch = kBytes;
+            copy.dstMemoryType = CUDA_MEMORY_DEVICE;
+            copy.dstDevice = probe.device;
+            copy.dstPitch = kBytes;
+            copy.WidthInBytes = kBytes;
+            copy.Height = 1;
+            result = g.cu.memcpy2D(&copy);
+            if (result == 0)
+                result = g.cu.ctxSynchronize();
+            return result != 0 ? 100 + result : 0;
+        });
+        if (copied == 1)
+            std::snprintf(text, sizeof(text), "HIP does not see what D3D12 wrote into the shared buffer");
+        else if (copied != 0)
+            std::snprintf(text, sizeof(text), "a HIP copy of the shared buffer failed (%d)", copied - 100);
+        else if (FAILED(hr = run(readback, probe.d3d12, 2)))
+            std::snprintf(text, sizeof(text), "the D3D12 copy out of the shared buffer failed (0x%08lx)",
+                          static_cast<unsigned long>(hr));
+        else if (SUCCEEDED(readback->Map(0, nullptr, &mapped)))
+        {
+            ok = std::memcmp(mapped, fromHip.data(), kBytes) == 0;
+            const D3D12_RANGE none = {0, 0};
+            readback->Unmap(0, &none);
+            if (!ok)
+                std::snprintf(text, sizeof(text), "D3D12 does not see what HIP wrote into the shared buffer");
+        }
+        else
+            std::snprintf(text, sizeof(text), "mapping the readback buffer failed");
+    }
+    for (IUnknown* object : {static_cast<IUnknown*>(readback), static_cast<IUnknown*>(upload),
+                             static_cast<IUnknown*>(fence), static_cast<IUnknown*>(list),
+                             static_cast<IUnknown*>(allocator), static_cast<IUnknown*>(queue)})
+        if (object != nullptr)
+            object->Release();
+    if (event != nullptr)
+        CloseHandle(event);
+    why = text;
+    return ok;
+}
+
+// Native Windows, game thread, once: D3D12 shared buffers mapped into CUDA, if the bridge and HIP can.
+static void init_native_vram_interop()
+{
+    load_export(g.cuda, "d4rImportWin32Memory", g_vk.importWin32);
+    load_export(g.cuda, "d4rReleaseVulkanMemory", g_vk.release);
+    if (g_vk.importWin32 == nullptr || g_vk.release == nullptr)
+    {
+        logf("VRAM interop: the nvcuda bridge has no D3D12 import; inputs and the result go through host memory");
+        return;
+    }
+    g_vk.native = true;
+    VramBuffer probe;
+    if (!create_vram_buffer(probe, 65536))
+    {
+        g_vk.native = false;
+        logf("VRAM interop: HIP cannot map a shared D3D12 buffer on this driver (d4r\\nvcuda.dll's log line above "
+             "says why); inputs and the result go through host memory (docs/windows.md)");
+        return;
+    }
+    // D4R_SHIM_VRAM_CHECK=0 skips the round trip (the WARP tests' mock HIP shares nothing with D3D12)
+    std::string why;
+    if (env_uint("D4R_SHIM_VRAM_CHECK", 1) != 0 && !native_round_trip(probe, why))
+    {
+        destroy_vram_buffer(probe);
+        g_vk.native = false;
+        logf("VRAM interop: HIP maps shared D3D12 buffers on this driver, but the bytes do not cross (%s); inputs "
+             "and the result go through host memory (docs/windows.md)", why.c_str());
+        return;
+    }
+    recycle_vram_buffer(probe); // pooled for the first feature
+    g_vk.ready = true;
+    logf("VRAM interop: ready (native Windows: D3D12 shared buffers mapped into HIP); used when the game's "
+         "resources are in DLSS's own formats");
+}
 
 static bool vram_interop_requested()
 {
@@ -2094,7 +2379,10 @@ static void init_vram_interop()
 {
     if (FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), reinterpret_cast<void**>(&g_vk.interop))))
     {
-        logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
+        if (running_under_wine())
+            logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
+        else
+            init_native_vram_interop();
         return;
     }
     VkInstance instance = VK_NULL_HANDLE;
@@ -2208,11 +2496,64 @@ static bool take_pooled_vram_buffer(VramBuffer& target, size_t bytes)
     return true;
 }
 
+static bool vram_allocated(const VramBuffer& buffer)
+{
+    return buffer.buffer != VK_NULL_HANDLE || buffer.d3d12 != nullptr;
+}
+
+// Native Windows: a committed D3D12 buffer in VRAM, shared, mapped into CUDA by the bridge.
+static bool create_d3d12_vram_buffer(VramBuffer& target, size_t bytes)
+{
+    VramBuffer buffer;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; // the same-frame wait's status and present buffers
+    HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr, __uuidof(ID3D12Resource),
+                                                   reinterpret_cast<void**>(&buffer.d3d12));
+    HANDLE handle = nullptr;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateSharedHandle(buffer.d3d12, nullptr, GENERIC_ALL, nullptr, &handle);
+    int imported = -1;
+    if (SUCCEEDED(hr))
+    {
+        D3D12_RESOURCE_ALLOCATION_INFO info;
+        g.device->GetResourceAllocationInfo(&info, 0, 1, &desc);
+        // HIP does not take ownership of the handle; the resource keeps the memory alive
+        imported = g.worker.call([&] {
+            return g_vk.importWin32(handle, 5 /* hipExternalMemoryHandleTypeD3D12Resource */, info.SizeInBytes,
+                                    &buffer.device, &buffer.external);
+        });
+        CloseHandle(handle);
+    }
+    if (FAILED(hr) || imported != 0)
+    {
+        logf("VRAM interop: shared D3D12 buffer of %zu bytes failed (HRESULT 0x%08lx, import %d)", bytes,
+             static_cast<unsigned long>(hr), imported);
+        if (buffer.d3d12 != nullptr)
+            buffer.d3d12->Release();
+        return false;
+    }
+    buffer.bytes = bytes;
+    target = buffer;
+    return true;
+}
+
 // Game thread. The CUDA import runs on the worker, which owns the context.
 static bool create_vram_buffer(VramBuffer& target, size_t bytes)
 {
     if (take_pooled_vram_buffer(target, bytes))
         return true;
+    if (g_vk.native)
+        return create_d3d12_vram_buffer(target, bytes);
     VramBuffer buffer;
     VkExternalMemoryBufferCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
@@ -2273,13 +2614,15 @@ static void destroy_vram_buffer(VramBuffer& buffer)
         g_vk.free(g_vk.device, buffer.memory, nullptr);
     if (buffer.buffer != VK_NULL_HANDLE)
         g_vk.destroyBuffer(g_vk.device, buffer.buffer, nullptr);
+    if (buffer.d3d12 != nullptr)
+        buffer.d3d12->Release();
     buffer = VramBuffer{};
 }
 
 // Only once no command list or CUDA work uses the buffer: keeps it for a later feature (see g_vramPool).
 static void recycle_vram_buffer(VramBuffer& buffer)
 {
-    if (buffer.buffer == VK_NULL_HANDLE)
+    if (!vram_allocated(buffer))
         return;
     {
         std::lock_guard<std::mutex> lock(g_vramPoolMutex);
@@ -2388,7 +2731,37 @@ struct VramCopy
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     bool convert = false; // blit to/from the plane's canonical format
     UINT width = 0, height = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {}; // native Windows: the texture's layout in a buffer
+    DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;               // native Windows with convert: the shader's typed view
+    d4r_convert::Kind kind = d4r_convert::Kind::Color;
 };
+
+// Native Windows: the compute-shader conversions (tools/d4r_d3d12_convert.h), set up on first need.
+static d4r_convert::Converter g_convert;
+static bool convert_ready()
+{
+    static std::once_flag once;
+    static bool ready = false;
+    std::call_once(once, [] {
+        std::string error;
+        ready = g_convert.init(g.device, error);
+        logf("VRAM interop: format conversion shaders %s%s", ready ? "ready" : "unavailable: ",
+             ready ? "" : error.c_str());
+    });
+    return ready;
+}
+
+// Row pitch of a plane or the result in its shared buffer: tight for Vulkan copies, 256-byte aligned for
+// D3D12's buffer footprints.
+static size_t vram_row_bytes(size_t rowBytes)
+{
+    return g_vk.native ? (rowBytes + 255) & ~static_cast<size_t>(255) : rowBytes;
+}
+
+static size_t vram_output_pitch(UINT width)
+{
+    return vram_row_bytes(static_cast<size_t>(width) * 8);
+}
 
 static bool vram_blit_supported(VkFormat source, VkFormat destination)
 {
@@ -2449,6 +2822,36 @@ static bool vram_motion_blit_supported(VkFormat format)
 // to/from the canonical layout of `plane`.
 static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false)
 {
+    if (g_vk.native)
+    {
+        // a raw copy: the texture must already be in the plane's canonical format
+        D3D12_RESOURCE_DESC desc;
+        resource->GetDesc(&desc);
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
+            return false;
+        const bool canonical = output ? desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                                            desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
+                                      : canonical_input(plane, desc.Format);
+        copy.resource = resource;
+        copy.width = static_cast<UINT>(desc.Width);
+        copy.height = desc.Height;
+        copy.convert = !canonical;
+        if (canonical)
+        {
+            UINT64 total = 0;
+            g.device->GetCopyableFootprints(&desc, 0, 1, 0, &copy.footprint, nullptr, nullptr, &total);
+            return true;
+        }
+        // other formats: a compute shader converts through a typed view
+        using d4r_convert::Kind;
+        copy.kind = output || plane == Plane::Color ? Kind::Color : plane == Plane::Motion ? Kind::Motion : Kind::Scalar;
+        copy.view = output ? d4r_convert::output_view(desc.Format)
+                           : d4r_convert::input_view(copy.kind, plane == Plane::Exposure, desc.Format);
+        if (copy.view == DXGI_FORMAT_UNKNOWN || !convert_ready())
+            return false;
+        return output ? (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 && g_convert.can_store(copy.view)
+                      : (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 && g_convert.can_read(copy.view);
+    }
     UINT64 handle = 0, offset = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     if (FAILED(g_vk.interop->GetVulkanResourceInfo1(resource, &handle, &offset, &format)) || handle == 0)
@@ -2489,11 +2892,64 @@ static VkBufferImageCopy full_region(const VramCopy& copy)
     return region;
 }
 
+// Native Windows: where a texture's copy lands in (or comes from) a shared buffer.
+static D3D12_TEXTURE_COPY_LOCATION buffer_location(ID3D12Resource* buffer, const VramCopy& copy, size_t rowBytes)
+{
+    D3D12_TEXTURE_COPY_LOCATION location = {};
+    location.pResource = buffer;
+    location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    location.PlacedFootprint = copy.footprint;
+    location.PlacedFootprint.Offset = 0;
+    location.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(rowBytes);
+    return location;
+}
+
+static D3D12_TEXTURE_COPY_LOCATION texture_location(ID3D12Resource* texture)
+{
+    D3D12_TEXTURE_COPY_LOCATION location = {};
+    location.pResource = texture;
+    location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    location.SubresourceIndex = 0; // a depth-stencil texture's depth plane
+    return location;
+}
+
 // Records the input copies into the slot's buffers. The resources are in
 // COPY_SOURCE state already.
 static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot,
                                const VramCopy* copies, int count, uint32_t frame)
 {
+    if (g_vk.native)
+    {
+        // the shared buffers are in COMMON state, which copies promote implicitly
+        for (int index = 0; index < count; ++index)
+        {
+            const VramCopy& copy = copies[index];
+            if (copy.convert)
+            {
+                g_convert.record_input(list, copy.resource, copy.view, copy.kind, slot.vram[index].d3d12,
+                                       static_cast<uint32_t>(slot.host[index].rowBytes), copy.width, copy.height);
+                continue;
+            }
+            const D3D12_TEXTURE_COPY_LOCATION source = texture_location(copy.resource);
+            const D3D12_TEXTURE_COPY_LOCATION destination =
+                buffer_location(slot.vram[index].d3d12, copy, slot.host[index].rowBytes);
+            list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
+        if (feature.gpuWait)
+        {
+            // once the copies above are done: DLSS's stream waits on the GPU for this value
+            ID3D12GraphicsCommandList2* list2 = nullptr;
+            if (FAILED(list->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&list2))))
+                return false;
+            transition(list, feature.gpuMarker.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER marker = {feature.gpuMarker.d3d12->GetGPUVirtualAddress(), frame};
+            D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            list2->WriteBufferImmediate(1, &marker, &mode);
+            list2->Release();
+            transition(list, feature.gpuMarker.d3d12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        }
+        return true;
+    }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
         return false;
@@ -2559,6 +3015,20 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
 static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer& buffer, const VramCopy& copy,
                                const VramImage& conversion)
 {
+    if (g_vk.native)
+    {
+        if (copy.convert)
+        {
+            g_convert.record_output(list, buffer.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
+                                    static_cast<uint32_t>(vram_output_pitch(copy.width)), copy.resource, copy.view,
+                                    copy.width, copy.height);
+            return true;
+        }
+        const D3D12_TEXTURE_COPY_LOCATION destination = texture_location(copy.resource);
+        const D3D12_TEXTURE_COPY_LOCATION source = buffer_location(buffer.d3d12, copy, vram_output_pitch(copy.width));
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        return true;
+    }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
         return false;
@@ -2603,6 +3073,78 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
     return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
 }
 
+// --- Same-frame results on native Windows (tools/d4r_d3d12_inline.h) ------------------
+//
+// FrameAge = 0 on Windows: the game's command list waits on the GPU, after the input copies, until HIP releases
+// the frame (d4rStreamWriteValue32 after DLSS's output copy), then copies the newest result not newer than the
+// frame into the output. The split-frame bookkeeping below (output slot frame % kOutputSlots, release of dropped
+// frames, the watchdog) is shared with Proton's split frames; only the release mechanism differs.
+
+static d4r_inline::Presenter g_inline;
+static std::once_flag g_inlineOnce;
+static bool g_inlineReady = false;
+
+static uint32_t inline_max_spins()
+{
+    // spins of one atomic load each: a fraction of a second on a desktop GPU, far below Windows' GPU timeout
+    static const uint32_t spins = env_uint("D4R_SHIM_INLINE_SPINS", 2000000);
+    return spins;
+}
+
+static void start_split_watchdog();
+
+// Game thread, once per feature.
+static bool init_inline_wait(Feature& feature)
+{
+    std::call_once(g_inlineOnce, [] {
+        std::string error;
+        g_inlineReady = g.cu.streamWriteValue32 != nullptr && g.cu.writeValue32 != nullptr && g_inline.init(g.device, error);
+        if (!g_inlineReady)
+            logf("same-frame results unavailable: %s; each frame shows the newest finished result",
+                 g.cu.streamWriteValue32 == nullptr ? "the nvcuda bridge has no d4rStreamWriteValue32" : error.c_str());
+    });
+    if (!g_inlineReady || !create_vram_buffer(feature.inlineStatus, d4r_inline::kStatusBytes))
+        return false;
+    // a pooled buffer holds an earlier feature's frames
+    const int cleared = g.worker.call([&feature] {
+        int result = 0;
+        for (uint32_t word = 0; word < d4r_inline::kStatusWords && result == 0; ++word)
+            result = g.cu.writeValue32(feature.inlineStatus.device + 4 * word, 0);
+        return result;
+    });
+    if (cleared != 0)
+    {
+        logf("same-frame results: clearing the status buffer failed (%d)", cleared);
+        recycle_vram_buffer(feature.inlineStatus);
+        return false;
+    }
+    start_split_watchdog(); // releases frames that never got their result
+    return true;
+}
+
+// Records the GPU-side wait for `frame` and the copy of the result into `output` (in COPY_DEST state).
+static void record_inline_output(ID3D12GraphicsCommandList* list, Feature& feature, const VramCopy& output,
+                                 uint32_t frame)
+{
+    ID3D12Resource* slots[d4r_inline::kSlots];
+    for (int slot = 0; slot < d4r_inline::kSlots; ++slot)
+        slots[slot] = feature.outputs[slot].vram.d3d12;
+    const size_t pitch = vram_output_pitch(output.width);
+    g_inline.record(list, feature.inlineStatus.d3d12, slots, feature.inlinePresent.d3d12, frame,
+                    pitch * output.height, inline_max_spins());
+    if (output.convert)
+    {
+        g_convert.record_output(list, feature.inlinePresent.d3d12, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_COMMON, static_cast<uint32_t>(pitch), output.resource, output.view,
+                                output.width, output.height);
+        return;
+    }
+    const D3D12_TEXTURE_COPY_LOCATION destination = texture_location(output.resource);
+    const D3D12_TEXTURE_COPY_LOCATION source = buffer_location(feature.inlinePresent.d3d12, output, pitch);
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    transition(list, feature.inlinePresent.d3d12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
 // --- Split frames -------------------------------------------------------------------
 //
 // To present frame N's own result, everything the game records after its DLSS
@@ -2619,6 +3161,20 @@ static void signal_split(Feature* feature, uint64_t value, const char* reason)
     std::lock_guard<std::mutex> lock(feature->splitMutex);
     if (value <= feature->splitSignalled)
         return;
+    if (g_vk.native)
+    {
+        // A frame without a result of its own (dropped, or late for the watchdog): release the GPU-side wait from
+        // the CPU; the wait then shows the newest older result. Frames with a result were released on the GPU.
+        const int result = g.cu.writeValue32(feature->inlineStatus.device + 4 * d4r_inline::kReleased,
+                                             static_cast<uint32_t>(value));
+        feature->splitSignalled = value;
+        if (reason != nullptr)
+            ++feature->inlineTimeouts;
+        if (result != 0 || reason != nullptr)
+            logf("split frame %llu released%s%s (result %d)", static_cast<unsigned long long>(value),
+                 reason != nullptr ? " by " : "", reason != nullptr ? reason : "", result);
+        return;
+    }
     VkSemaphoreSignalInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
     info.semaphore = feature->splitSemaphore;
     info.value = value;
@@ -2688,6 +3244,12 @@ static void split_watchdog()
     }
 }
 
+static void start_split_watchdog()
+{
+    static std::once_flag watchdog;
+    std::call_once(watchdog, [] { std::thread(split_watchdog).detach(); });
+}
+
 static bool create_split_semaphore(Feature& feature)
 {
     VkSemaphoreTypeCreateInfo type = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -2699,8 +3261,7 @@ static bool create_split_semaphore(Feature& feature)
         logf("split frames: vkCreateSemaphore failed");
         return false;
     }
-    static std::once_flag watchdog;
-    std::call_once(watchdog, [] { std::thread(split_watchdog).detach(); });
+    start_split_watchdog();
     return true;
 }
 
@@ -2708,9 +3269,9 @@ static bool create_split_semaphore(Feature& feature)
 // released since queued command lists may still reference it.
 static bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t bytes)
 {
-    if (buffer.buffer != VK_NULL_HANDLE && buffer.bytes >= bytes)
+    if (vram_allocated(buffer) && buffer.bytes >= bytes)
         return true;
-    if (buffer.buffer != VK_NULL_HANDLE)
+    if (vram_allocated(buffer))
         feature.retiredBuffers.push_back(buffer);
     buffer = VramBuffer{};
     return create_vram_buffer(buffer, bytes);
@@ -2736,6 +3297,8 @@ static void release_vram(Feature& feature)
     for (OutputSlot& slot : feature.outputs)
         recycle_vram_buffer(slot.vram);
     recycle_vram_buffer(feature.gpuMarker);
+    recycle_vram_buffer(feature.inlineStatus);
+    recycle_vram_buffer(feature.inlinePresent);
     for (VramBuffer& buffer : feature.retiredBuffers)
         recycle_vram_buffer(buffer);
     feature.retiredBuffers.clear();
@@ -3554,13 +4117,15 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
                 logf("frame %u VRAM verify plane=%d: %zu of %zu bytes differ from host staging", frame, index,
                      differing, vram.size());
         }
+        // a row of the array; the buffer's rows may be longer (256-byte aligned for D3D12 on native Windows)
+        const size_t texelRowBytes = canonical_texel_bytes(planes[index]) * geometry.width;
         CudaMemcpy2D copy = {};
         copy.srcMemoryType = CUDA_MEMORY_DEVICE;
         copy.srcDevice = slot.vram[index].device;
         copy.srcPitch = geometry.rowBytes;
         copy.dstMemoryType = CUDA_MEMORY_ARRAY;
         copy.dstArray = images[index]->array;
-        copy.WidthInBytes = geometry.rowBytes;
+        copy.WidthInBytes = texelRowBytes;
         copy.Height = geometry.height;
         result = copy_2d(copy);
         // D4R_SHIM_VRAM_ARRAY_VERIFY=1: read the CUDA array DLSS samples back
@@ -3576,7 +4141,7 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
             readBuffer.dstMemoryType = CUDA_MEMORY_HOST;
             readBuffer.dstHost = fromBuffer.data();
             readBuffer.dstPitch = geometry.rowBytes;
-            readBuffer.WidthInBytes = geometry.rowBytes;
+            readBuffer.WidthInBytes = texelRowBytes;
             readBuffer.Height = geometry.height;
             CudaMemcpy2D readArray = {};
             readArray.srcMemoryType = CUDA_MEMORY_ARRAY;
@@ -3584,7 +4149,7 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
             readArray.dstMemoryType = CUDA_MEMORY_HOST;
             readArray.dstHost = fromArray.data();
             readArray.dstPitch = geometry.rowBytes;
-            readArray.WidthInBytes = geometry.rowBytes;
+            readArray.WidthInBytes = texelRowBytes;
             readArray.Height = geometry.height;
             if (g.cu.memcpy2D(&readBuffer) == 0 && g.cu.memcpy2D(&readArray) == 0)
             {
@@ -3625,15 +4190,55 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     }
     const VramBuffer& buffer = feature->outputs[target].vram;
     const size_t rowBytes = static_cast<size_t>(feature->output.width) * 8;
+    const size_t pitch = vram_output_pitch(feature->output.width); // rowBytes, but 256-aligned for D3D12
     CudaMemcpy2D copy = {};
     copy.srcMemoryType = CUDA_MEMORY_ARRAY;
     copy.srcArray = feature->output.array;
     copy.dstMemoryType = CUDA_MEMORY_DEVICE;
     copy.dstDevice = buffer.device;
-    copy.dstPitch = rowBytes;
+    copy.dstPitch = pitch;
     copy.WidthInBytes = rowBytes;
     copy.Height = feature->output.height;
-    int result = rowBytes * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
+    int result = pitch * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
+    if (result == 0 && params.split && g_vk.native)
+    {
+        // Native same-frame results: release the game's GPU-side wait right behind the output copy, on the GPU.
+        const CudaDevicePtr status = feature->inlineStatus.device;
+        int released = g.cu.streamWriteValue32(status + 4 * (d4r_inline::kProduced + target), frame);
+        if (released == 0)
+            released = g.cu.streamWriteValue32(status + 4 * d4r_inline::kReleased, frame);
+        if (released == 0)
+        {
+            std::lock_guard<std::mutex> lock(feature->splitMutex);
+            if (frame > feature->splitSignalled)
+                feature->splitSignalled = frame;
+        }
+        else
+            logf("frame %u: queueing the GPU-side release failed: %d", frame, released);
+        // How long the game's GPU-side waits spin, from the status buffer (the wait of an earlier frame, which has
+        // run by now): at the spin limit the wait ended without its result.
+        static const bool always = env_uint("D4R_SHIM_INLINE_TRACE", 0) != 0;
+        if (always || frame <= 8 || frame % 300 == 0)
+        {
+            uint32_t words[d4r_inline::kStatusWords] = {};
+            CudaMemcpy2D read = {};
+            read.srcMemoryType = CUDA_MEMORY_DEVICE;
+            read.srcDevice = status;
+            read.dstMemoryType = CUDA_MEMORY_HOST;
+            read.dstHost = words;
+            read.WidthInBytes = sizeof(words);
+            read.Height = 1;
+            if (g.cu.memcpy2D(&read) == 0 && words[d4r_inline::kChosen] != d4r_inline::kNoSlot)
+            {
+                const bool limit = words[d4r_inline::kSpins] >= inline_max_spins();
+                if (limit)
+                    ++feature->inlineTimeouts;
+                logf("frame %u: same-frame wait of an earlier frame spun %u times%s (released %u, slot %u)", frame,
+                     words[d4r_inline::kSpins], limit ? ", the limit: no result in time" : "",
+                     words[d4r_inline::kReleased], words[d4r_inline::kChosen]);
+            }
+        }
+    }
     if (result == 0)
     {
         const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -3685,10 +4290,11 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         CudaMemcpy2D readArray = copy;
         readArray.dstMemoryType = CUDA_MEMORY_HOST;
         readArray.dstHost = fromArray.data();
+        readArray.dstPitch = rowBytes;
         CudaMemcpy2D readBuffer = {};
         readBuffer.srcMemoryType = CUDA_MEMORY_DEVICE;
         readBuffer.srcDevice = buffer.device;
-        readBuffer.srcPitch = rowBytes;
+        readBuffer.srcPitch = pitch;
         readBuffer.dstMemoryType = CUDA_MEMORY_HOST;
         readBuffer.dstHost = fromBuffer.data();
         readBuffer.dstPitch = rowBytes;
@@ -3718,6 +4324,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         host.rowBytes = rowBytes;
         copy.dstMemoryType = CUDA_MEMORY_HOST;
         copy.dstHost = host.bytes;
+        copy.dstPitch = rowBytes;
         if (g.cu.memcpy2D(&copy) == 0)
         {
             log_output_hash(host, frame);
@@ -4563,19 +5170,47 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     {
         feature->vramDecided = true;
         feature->vram = p.vram;
-        feature->split = p.vram && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 && g_vk.split != nullptr &&
-                         create_split_semaphore(*feature);
+        feature->split = p.vram && env_uint("D4R_SHIM_SPLIT_FRAME", 0) != 0 &&
+                         (g_vk.native ? init_inline_wait(*feature)
+                                      : g_vk.split != nullptr && create_split_semaphore(*feature));
         if (feature->split && env_uint("D4R_SHIM_GPU_WAIT", 0) != 0 && g.cu.streamWaitValue32 != nullptr &&
-            g.cu.writeValue32 != nullptr && g_vk.fill != nullptr)
+            g.cu.writeValue32 != nullptr && (g_vk.fill != nullptr || g_vk.native))
             feature->gpuWait = ensure_vram_buffer(*feature, feature->gpuMarker, 256) &&
                                g.worker.call([feature] { return g.cu.writeValue32(feature->gpuMarker.device, 0); }) == 0;
         feature->linearInputs = feature->gpuWait && env_uint("D4R_SHIM_LINEAR_INPUTS", 0) != 0 &&
                                 g.cu.registerLinearTexture != nullptr;
         if (feature->linearInputs)
             logf("linear inputs: NGX samples the interop buffers directly");
+        if (p.vram && g_vk.native)
+        {
+            static const char* const names[4] = {"colour", "depth", "motion", "exposure"};
+            std::string converted;
+            for (int index = 0; index < inputCount; ++index)
+                if (vramInputs[index].convert)
+                    converted += std::string(converted.empty() ? "" : ", ") + names[index];
+            if (vramOutput.convert)
+                converted += std::string(converted.empty() ? "" : ", ") + "output";
+            if (!converted.empty())
+                logf("VRAM interop: converting %s on the GPU (formats other than DLSS's own)", converted.c_str());
+        }
         logf("VRAM interop %s for this feature%s%s", p.vram ? "on" : "off",
-             feature->split ? ", presenting each frame's own result (split frames)" : "",
+             feature->split ? (g_vk.native ? ", presenting each frame's own result (GPU-side wait in the game's "
+                                             "command list)"
+                                           : ", presenting each frame's own result (split frames)")
+                            : "",
              feature->gpuWait ? ", DLSS queued behind a GPU-side wait for the inputs" : "");
+    }
+    else if (feature->split && g_vk.native && feature->inlineTimeouts.load() >= 3)
+    {
+        logf("frame %u: the GPU-side waits for DLSS keep timing out (%d); showing the newest finished result from "
+             "now on (as FrameAge = 1)", frame, feature->inlineTimeouts.load());
+        drain_pipeline();
+        {
+            std::lock_guard<std::mutex> lock(feature->splitMutex);
+            feature->split = false;
+        }
+        feature->gpuWait = false;
+        feature->linearInputs = false;
     }
     else if (feature->vram && !p.vram)
     {
@@ -4599,25 +5234,27 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             HostPlane& geometry = slot.host[index]; // geometry only; the bytes stay in VRAM
             geometry.width = vramInputs[index].width;
             geometry.height = vramInputs[index].height;
-            geometry.rowBytes = canonical_texel_bytes(planes[index]) * geometry.width;
+            geometry.rowBytes = vram_row_bytes(canonical_texel_bytes(planes[index]) * geometry.width);
             if (feature->linearInputs)
                 geometry.rowBytes = (geometry.rowBytes + 255) & ~static_cast<size_t>(255); // texture pitch alignment
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
-        if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
-                                                               vramInputs[0].width, vramInputs[0].height,
-                                                               VK_FORMAT_R16G16B16A16_SFLOAT))
+        // Vulkan blits convert through intermediate images; native Windows' shaders need none
+        const bool blits = !g_vk.native;
+        if (blits && vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
+                                                                        vramInputs[0].width, vramInputs[0].height,
+                                                                        VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
+        if (blits && vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
                                                                vramInputs[2].width, vramInputs[2].height,
                                                                VK_FORMAT_R16G16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (inputCount == 4 && vramInputs[3].convert &&
+        if (blits && inputCount == 4 && vramInputs[3].convert &&
             !ensure_conversion_image(*feature, feature->exposureConversion,
                                      vramInputs[3].width, vramInputs[3].height, VK_FORMAT_R32_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
+        if (blits && vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
                                                              vramOutput.width, vramOutput.height,
                                                              VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
@@ -4641,9 +5278,22 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         for (OutputSlot& outputSlot : feature->outputs)
         {
             outputSlot.staging.release();
-            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram, static_cast<size_t>(outputDesc.Width) * 8 *
-                                                                            outputDesc.Height)
+            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram,
+                                             vram_output_pitch(static_cast<UINT>(outputDesc.Width)) * outputDesc.Height)
                        : !ensure_staging(outputSlot.staging, output, D3D12_HEAP_TYPE_UPLOAD))
+                return NGX_FAIL_PLATFORM_ERROR;
+        }
+        if (p.vram && feature->split && g_vk.native)
+        {
+            // the slots' earlier results are gone; nothing is queued (drained above)
+            if (!ensure_vram_buffer(*feature, feature->inlinePresent,
+                                    vram_output_pitch(static_cast<UINT>(outputDesc.Width)) * outputDesc.Height) ||
+                g.worker.call([feature] {
+                    int result = 0;
+                    for (int slot = 0; slot < d4r_inline::kSlots && result == 0; ++slot)
+                        result = g.cu.writeValue32(feature->inlineStatus.device + 4 * (d4r_inline::kProduced + slot), 0);
+                    return result;
+                }) != 0)
                 return NGX_FAIL_PLATFORM_ERROR;
         }
     }
@@ -4703,14 +5353,17 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     }
     const auto outputRecordStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     if (p.vram && feature->split)
-        p.split = SUCCEEDED(g_vk.split->SplitCommandListForExternalWait(
-            list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
+        p.split = g_vk.native || SUCCEEDED(g_vk.split->SplitCommandListForExternalWait(
+                                     list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
     if (p.split)
     {
-        // Runs in the second half of the list, once frame's result is in place.
+        // Runs in the second half of the list (native Windows: after a GPU-side wait), once frame's result is in
+        // place.
         const int target = static_cast<int>(frame % kOutputSlots);
         transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
+        if (g_vk.native)
+            record_inline_output(list, *feature, vramOutput, frame);
+        else if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
             logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
         transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
         if (timing.enabled)

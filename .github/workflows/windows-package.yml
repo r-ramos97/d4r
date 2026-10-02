@@ -1,0 +1,156 @@
+# The d4r package for native Windows (scripts/package_windows.sh) from this commit's d4r DLLs and the ZLUDA and
+# kernel artifacts of the last successful windows.yml run (or, called by windows.yml, of that run), then
+# d4r\setup.ps1 on a Windows runner.
+name: Windows package
+
+on:
+  push:
+    branches: [windows-native]
+  # windows.yml calls this once ZLUDA is built, with its own artifacts (a workflow_run trigger would fire only
+  # for workflows on the repository's default branch)
+  workflow_call:
+    inputs:
+      same-run:
+        description: package the calling run's ZLUDA and kernel artifacts
+        type: boolean
+        default: false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    name: Package
+    runs-on: ubuntu-24.04
+    outputs:
+      packaged: ${{ steps.inputs.outputs.found }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: ZLUDA from this Windows build
+        if: inputs.same-run
+        uses: actions/download-artifact@v4
+        with:
+          name: zluda-windows
+          path: inputs/zluda
+      - name: Kernels from this Windows build
+        if: inputs.same-run
+        uses: actions/download-artifact@v4
+        with:
+          name: network-kernels
+          path: inputs/kernels
+      - name: ZLUDA and kernels from the last successful Windows build
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          SAME_RUN: ${{ inputs.same-run }}
+        run: |
+          if [ "$SAME_RUN" = "true" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "ZLUDA and kernels from this run"
+            exit 0
+          fi
+          run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows.yml --branch "$BRANCH" --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "::warning::no successful windows.yml run on $BRANCH yet; nothing to package"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh run download "$run_id" -R "$GITHUB_REPOSITORY" -n zluda-windows -D inputs/zluda
+          gh run download "$run_id" -R "$GITHUB_REPOSITORY" -n network-kernels -D inputs/kernels
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "ZLUDA and kernels from run $run_id"
+      - name: Install MinGW-w64, clang-cl and Vulkan headers
+        if: steps.inputs.outputs.found == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix clang-tools-18 libvulkan-dev zip
+      - name: Package
+        if: steps.inputs.outputs.found == 'true'
+        run: scripts/package_windows.sh dist
+        env:
+          D4R_WIN_ZLUDA: inputs/zluda
+          D4R_WIN_KERNELS: inputs/kernels
+          CLANG_CL: /usr/lib/llvm-18/bin/clang-cl
+          MINGW_CXX: x86_64-w64-mingw32-g++-posix
+      - uses: actions/upload-artifact@v4
+        if: steps.inputs.outputs.found == 'true'
+        with:
+          name: d4r-windows
+          path: dist/*.zip*
+          if-no-files-found: error
+
+  setup-script:
+    name: d4r\setup.ps1 on Windows
+    needs: package
+    if: needs.package.outputs.packaged == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: d4r-windows
+          path: package
+      - name: A game folder with the package, OptiScaler.ini and nothing from NVIDIA
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory game | Out-Null
+          Expand-Archive (Get-ChildItem package\*.zip).FullName -DestinationPath game
+          Set-Content game\game.exe "not a game"
+          Set-Content game\dxgi.dll "not OptiScaler"
+          $ini = "[Upscalers]`r`nDx12Upscaler=auto`r`n[DLSS]`r`nEnabled=auto`r`n[Libraries]`r`nOptiDllPath=auto`r`n" +
+                 "[Inputs]`r`nEnableDlssInputs=auto`r`n[Hooks]`r`nHookOriginalNvngxOnly=auto`r`n[NvApi]`r`n" +
+                 "OverrideNvapiDll=auto`r`n[Spoofing]`r`nDxgi=auto`r`n[FrameGen]`r`nEnabled=auto`r`nFGInput=auto`r`n" +
+                 "FGOutput=auto`r`n"
+          [IO.File]::WriteAllText("$PWD\game\OptiScaler.ini", $ini)
+      - name: Check only
+        shell: powershell
+        run: |
+          $out = powershell -ExecutionPolicy Bypass -File game\d4r\setup.ps1 -GameFolder game -CheckOnly | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1 (NVIDIA's files missing), got $LASTEXITCODE" }
+          foreach ($line in "ok       d4r\nvngx.dll", "ok       d4r\zluda\zluda_nvcuda.dll", "ok       OptiScaler as dxgi.dll",
+                            "MISSING  d4r\nvngx_dlss.dll", "MISSING  OptiScaler.ini needs") {
+            if (-not $out.Contains($line)) { throw "missing in the output: $line" }
+          }
+          if ((Get-Content game\OptiScaler.ini -Raw).Contains("Dx12Upscaler=dlss")) { throw "-CheckOnly changed OptiScaler.ini" }
+          exit 0 # the expected exit code 1 above would otherwise end the step
+      - name: Set up
+        shell: powershell
+        run: |
+          $out = powershell -ExecutionPolicy Bypass -File game\d4r\setup.ps1 -GameFolder game | Out-String
+          Write-Host $out
+          $ini = Get-Content game\OptiScaler.ini -Raw
+          foreach ($line in "Dx12Upscaler=dlss`r`n", "OptiDllPath=d4r`r`n", "OverrideNvapiDll=false`r`n", "FGOutput=nofg`r`n") {
+            if (-not $ini.Contains($line)) { throw "OptiScaler.ini lacks $line" }
+          }
+          if (-not (Test-Path game\OptiScaler.ini.d4r-backup)) { throw "no OptiScaler.ini backup" }
+          if (-not $out.Contains("ok       OptiScaler.ini: set")) { throw "setup did not report the OptiScaler.ini change" }
+          exit 0 # setup.ps1 still exits 1 here: no HIP and no NVIDIA files on this runner
+      - name: test-dlss.ps1 without an AMD GPU or NVIDIA's files (runs to its report)
+        shell: powershell
+        run: |
+          $out = powershell -ExecutionPolicy Bypass -File game\d4r\test-dlss.ps1 -GameFolder game -Frames 2 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1 (no DLSS on this runner), got $LASTEXITCODE" }
+          foreach ($line in "VRAM sharing check", "  RESULT: ", "harness exit code", "DLSS did not complete") {
+            if (-not $out.Contains($line)) { throw "missing in the output: $line" }
+          }
+          if (-not (Test-Path game\d4r\interop-report.txt)) { throw "no d4r\interop-report.txt" }
+          exit 0
+      - name: Collect logs
+        shell: powershell
+        run: |
+          Set-Content game\d4r\d4r_nvngx.log "a log line"
+          $out = powershell -ExecutionPolicy Bypass -File game\d4r\collect-logs.ps1 -GameFolder game | Out-String
+          Write-Host $out
+          $zip = Get-ChildItem game\d4r-report-*.zip | Select-Object -First 1
+          if (-not $zip) { throw "no report zip" }
+          Expand-Archive $zip.FullName -DestinationPath report
+          foreach ($name in "d4r_nvngx.log", "d4r.ini", "OptiScaler.ini", "setup-check.txt", "system.txt") {
+            if (-not (Test-Path "report\$name")) { throw "the report lacks $name" }
+          }
+          Get-Content report\system.txt | Write-Host
+          exit 0
