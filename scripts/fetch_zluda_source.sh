@@ -3,8 +3,9 @@
 #
 # usage: scripts/fetch_zluda_source.sh DIR
 #   ZLUDA_COMMIT       revision (default: the tested ee2f25a, docs/building.md)
-#   ZLUDA_SUBMODULES=1 also fetch the LLVM and HiGHS submodules and the OCKL device library from Git LFS, which
-#                      a full build needs; without it only sources (e.g. for the helper bitcode) are fetched
+#   ZLUDA_SUBMODULES=1 also fetch the LLVM and HiGHS submodules and, from Git LFS, the OCKL device library and
+#                      bin/nvcudart_hybrid64.dll (whose presence ZLUDA's Windows build checks), which a full build
+#                      needs; without it only sources (e.g. for the helper bitcode) are fetched
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,7 +19,7 @@ GIT_LFS_SKIP_SMUDGE=1 git -C "$DIR" -c advice.detachedHead=false checkout -q FET
 if [[ "${ZLUDA_SUBMODULES:-0}" == 1 ]]; then
   git -C "$DIR" submodule update --init --recursive --depth 1
   git -C "$DIR" lfs install --local
-  git -C "$DIR" lfs pull --include=llvm_zluda/src/device-libs/ockl.bc
+  git -C "$DIR" lfs pull --include=llvm_zluda/src/device-libs/ockl.bc,zluda/bin/nvcudart_hybrid64.dll
 fi
 for patch in "$ROOT"/patches/zluda/0*.patch; do
   git -C "$DIR" apply "$patch"
