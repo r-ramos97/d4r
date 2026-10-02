@@ -72,9 +72,12 @@ def build_binaries(out):
     run(flags + ["-shared", windows / "mock_ngx_core.c", "-o", out / "_nvngx.dll"])
     run(flags + [windows / "bridge_test.c", "-o", out / "bridge_test.exe"])
     run(flags + [windows / "shim_test.c", "-o", out / "shim_test.exe"])
-    run(flags + ["-std=gnu11", "-shared", "-static-libgcc", ROOT / "tools" / "d4r_nvapi_windows.c", "-o",
-                 out / "nvapi64.dll"])
+    run(["bash", ROOT / "scripts" / "build_windows_tools.sh"])
+    for name in ("nvapi64.dll", "version.dll", "d4r-manifest.exe"):
+        shutil.copy(ROOT / "build" / "windows" / name, out / name)
     run(flags + [windows / "nvapi_test.c", "-o", out / "nvapi_test.exe"])
+    run(flags + ["-shared", windows / "fake_optiscaler.c", "-lversion", "-o", out / "fake_optiscaler.dll"])
+    run(flags + [windows / "preload_test.c", "-o", out / "preload_test.exe"])
     if CLANG_CL:
         env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
         run(["bash", ROOT / "scripts" / "build_d4r_nvngx_shim.sh"], env=env)
@@ -127,7 +130,7 @@ class WindowsNativeBridgeTests(unittest.TestCase):
             env.setdefault("WINEPREFIX", str(Path.home() / ".cache" / "d4r-test-wineprefix"))
             Path(env["WINEPREFIX"]).parent.mkdir(parents=True, exist_ok=True)  # Wine creates only the prefix
             env["WINEDEBUG"] = "-all"
-            env["WINEDLLOVERRIDES"] = "mscoree,mshtml="
+            env.setdefault("WINEDLLOVERRIDES", "mscoree,mshtml=")
             command.insert(0, WINE)
         return subprocess.run(command, env=env, text=True, capture_output=True, timeout=600)
 
@@ -151,6 +154,17 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         shutil.copy(self.binaries / "nvapi64.dll", folder / "nvapi64.dll")
         self.assert_all_pass(self.run_program(self.binaries / "nvapi_test.exe", windows_path(folder / "nvapi64.dll"),
                                               extra_env={"D4R_NVAPI_LUID": "1:abcd"}))
+
+    def test_nvapi_loaded_before_optiscaler(self):
+        """OptiScaler enables DLSS only if NVIDIA's NVAPI is there when it starts: d4r's version.dll, which
+        OptiScaler imports from the game folder, must load d4r's nvapi64.dll before OptiScaler's DllMain."""
+        game = self.work / "preload-game"
+        game.mkdir(exist_ok=True)
+        for name in ("version.dll", "nvapi64.dll", "preload_test.exe"):
+            shutil.copy(self.binaries / name, game / name)
+        shutil.copy(self.binaries / "fake_optiscaler.dll", game / "dxgi.dll")
+        self.assert_all_pass(self.run_program(game / "preload_test.exe", windows_path(game),
+                                              extra_env={"WINEDLLOVERRIDES": "mscoree,mshtml=;dxgi,version=n,b"}))
 
     def test_shim_initialises_ngx_through_the_bridge(self):
         """A portable install on native Windows: OptiScaler loads d4r\\nvngx.dll, which reads d4r.ini and

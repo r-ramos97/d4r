@@ -437,6 +437,14 @@ static const struct
     {0x842b066e, (void*)&GPU_GetLogicalGpuInfo},
 };
 
+/* fakenvapi's own interfaces: OptiScaler takes an NVAPI that answers them for fakenvapi, that is, for no NVIDIA
+   GPU, so they are never forwarded to a chained fakenvapi */
+static int fakenvapi_private(unsigned int id)
+{
+    return id == 0x21372137 || id == 0x21382138 || id == 0x21392139 || id == 0x21402140 || id == 0x21412141 ||
+           id == 0x21422142;
+}
+
 __declspec(dllexport) void* __cdecl nvapi_QueryInterface(unsigned int id)
 {
     ensure_initialized();
@@ -445,7 +453,7 @@ __declspec(dllexport) void* __cdecl nvapi_QueryInterface(unsigned int id)
         if (implemented[i].id == id)
             function = implemented[i].function;
     const char* source = function != NULL ? "d4r" : "unimplemented";
-    if (function == NULL && state.chain != NULL)
+    if (function == NULL && state.chain != NULL && !fakenvapi_private(id))
     {
         function = state.chain(id);
         source = function != NULL ? "chained" : "unimplemented";

@@ -56,6 +56,7 @@ int main(int argc, char** argv)
           "adapter LUID (D4R_NVAPI_LUID)");
 
     check(query(0x31aa0ab2) == NULL, "unimplemented interface (a D3D12 extension) is NULL");
+    check(query(0x21382138) == NULL, "not fakenvapi (OptiScaler's check for it)");
 
     /* the log names what was asked for */
     char log[MAX_PATH];

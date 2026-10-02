@@ -14,7 +14,7 @@ what is missing.
                       Linux / Proton                              Windows
 game (D3D12)          vkd3d-proton (d4r-patched)                  AMD's D3D12 driver
 OptiScaler            dxgi.dll                                    dxgi.dll
-GPU identity          dxvk-nvapi, DXVK_NVAPI_GPU_ARCH=AD100        nvapi64.dll (tools/d4r_nvapi_windows.c)
+GPU identity          dxvk-nvapi, DXVK_NVAPI_GPU_ARCH=AD100        nvapi64.dll + version.dll (tools/)
 d4r\nvngx.dll         the shim, Proton mode                       the same shim, native Windows mode
 NGX core + DLSS       _nvngx.dll, nvngx_dlss.dll (CUDA path)      the same files
 d4r\nvcuda.dll        Wine builtin bridge (winegcc)               the same source, a MinGW-w64 DLL
@@ -70,6 +70,16 @@ backend only when NVAPI says NVIDIA. `tools/d4r_nvapi_windows.c` answers the ide
 driver 596.36 like the tested NGX core, the main DXGI adapter's LUID) and returns NULL for the rest, as for a
 feature the GPU lacks, unless `D4R_NVAPI_CHAIN` names another nvapi64.dll (fakenvapi) to forward them to. It
 logs every interface it is asked for, by name, to `d4r_nvapi.log`.
+
+OptiScaler 0.9.4 decides whether the GPU is NVIDIA's while it starts, in its `DllMain`: it asks an
+`nvapi64.dll` that is already loaded, else System32's, and turns its DLSS backend off when neither answers as
+NVIDIA's NVAPI (`isNvidia()` in its dllmain.cpp). d4r's nvapi64.dll in the game folder is loaded only later, so
+the package also has a `version.dll` (`tools/d4r_preload_version.c`). OptiScaler.dll imports version.dll, which
+Windows takes from the game folder, and Windows initialises a DLL's imports before the DLL: this version.dll loads
+d4r's nvapi64.dll first and forwards its 17 functions to System32's through one jump each. The test runs a
+stand-in OptiScaler that imports version.dll and records, in its own `DllMain`, that nvapi64.dll is already there.
+The NVAPI never forwards fakenvapi's private interfaces to a chained fakenvapi, because OptiScaler takes an NVAPI
+that answers them for fakenvapi, which means no NVIDIA GPU.
 
 ### Native kernel manifests
 

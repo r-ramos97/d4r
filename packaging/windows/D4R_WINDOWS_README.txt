@@ -29,8 +29,10 @@ What you need
 Install
 -------
 1. Extract this package into the folder that holds the game's main .exe. For Unreal Engine games that is
-   <game>\<Project>\Binaries\Win64\, next to <Project>-Win64-Shipping.exe. You get nvapi64.dll, this file
-   and a d4r folder.
+   <game>\<Project>\Binaries\Win64\, next to <Project>-Win64-Shipping.exe. You get nvapi64.dll,
+   version.dll, this file and a d4r folder. (OptiScaler enables DLSS only on an NVIDIA GPU; d4r's
+   version.dll loads d4r's nvapi64.dll before OptiScaler starts, so it sees one. If the folder already has
+   a version.dll from another mod, the two cannot be used together.)
 2. Copy OptiScaler.dll from OptiScaler 0.9.4 into the same folder as dxgi.dll, and its OptiScaler.ini.
 3. Copy nvngx_dlss.dll into the d4r folder, and _nvngx.dll into d4r\ngx.
 4. Open PowerShell in the game folder and run:
@@ -70,7 +72,7 @@ Not supported: DLSS Frame Generation, DLSS Ray Reconstruction, DirectX 11 and Vu
 
 Uninstall
 ---------
-Delete nvapi64.dll, dxgi.dll, OptiScaler.ini, OptiScaler.log, this file and the d4r folder from the game
+Delete nvapi64.dll, version.dll, dxgi.dll, OptiScaler.ini, OptiScaler.log, this file and the d4r folder from the game
 folder (restore OptiScaler.ini.d4r-backup if you used OptiScaler before). The caches in
 %LOCALAPPDATA%\zluda and %LOCALAPPDATA%\d4r can be deleted too.
 

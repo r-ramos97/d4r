@@ -45,10 +45,17 @@ foreach ($file in "nvapi64.dll", "d4r\nvngx.dll", "d4r\nvcuda.dll", "d4r\zluda\z
     if (Test-Path -LiteralPath (Join-Path $game $file) -PathType Leaf) { Ok $file }
     else { Bad "$file (extract the d4r package again)" }
 }
+# d4r's version.dll loads nvapi64.dll before OptiScaler starts, so that OptiScaler enables DLSS
+$version = Join-Path $game "version.dll"
+if (-not (Test-Path -LiteralPath $version -PathType Leaf)) { Bad "version.dll (extract the d4r package again)" }
+elseif ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($version)).Contains("d4r_preload_version")) {
+    Ok "version.dll (d4r's: loads nvapi64.dll before OptiScaler)"
+}
+else { Bad "version.dll is not d4r's (another mod, or OptiScaler installed as version.dll): install OptiScaler as dxgi.dll and extract the d4r package again" }
 
 # --- OptiScaler --------------------------------------------------------------------------------------------
 Write-Host "OptiScaler"
-$optiNames = "dxgi.dll", "winmm.dll", "version.dll", "dbghelp.dll", "d3d12.dll", "wininet.dll", "winhttp.dll", "OptiScaler.asi"
+$optiNames = "dxgi.dll", "winmm.dll", "dbghelp.dll", "d3d12.dll", "wininet.dll", "winhttp.dll", "OptiScaler.asi"
 $opti = $optiNames | Where-Object { Test-Path -LiteralPath (Join-Path $game $_) -PathType Leaf } | Select-Object -First 1
 if ($opti) { Ok "OptiScaler as $opti" }
 else { Bad "OptiScaler: copy OptiScaler.dll from an OptiScaler 0.9.4 release here as dxgi.dll" }

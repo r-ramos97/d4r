@@ -16,21 +16,17 @@ OUT="$(realpath -m "${1:-$ROOT/dist}")"
 VERSION="$(cat "$ROOT/packaging/VERSION")-windows-preview"
 NAME="d4r-$VERSION"
 STAGE="$OUT/$NAME"
-CC="${MINGW_CC:-x86_64-w64-mingw32-gcc}"
 : "${D4R_WIN_ZLUDA:?set D4R_WIN_ZLUDA to the folder with zluda_nvcuda.dll}"
 [[ -f "$D4R_WIN_ZLUDA/zluda_nvcuda.dll" ]] || { echo "no zluda_nvcuda.dll in $D4R_WIN_ZLUDA" >&2; exit 2; }
 
 "$ROOT/scripts/build_d3d12_dlss_harness.sh" >/dev/null  # the shim, and the harness d4r\test-dlss.ps1 runs
 "$ROOT/scripts/build_windows_nvcuda.sh" >/dev/null
-"$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -shared -static-libgcc -I "$ROOT/tools" \
-  "$ROOT/tools/d4r_nvapi_windows.c" -o "$ROOT/build/windows/nvapi64.dll"
-"$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -static -I "$ROOT/tools" \
-  "$ROOT/tools/d4r_manifest.c" -o "$ROOT/build/windows/d4r-manifest.exe"
+"$ROOT/scripts/build_windows_tools.sh" >/dev/null  # nvapi64.dll, version.dll, d4r-manifest.exe
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/d4r/zluda" "$STAGE/d4r/ngx" "$STAGE/d4r/tools" "$STAGE/d4r/licenses" "$STAGE/d4r/source"
 crlf() { sed 's/$/\r/' "$1" > "$2"; }
-cp "$ROOT/build/windows/nvapi64.dll" "$STAGE/nvapi64.dll"
+cp "$ROOT/build/windows/nvapi64.dll" "$ROOT/build/windows/version.dll" "$STAGE/"
 sed "s/@VERSION@/$VERSION/g" "$ROOT/packaging/windows/D4R_WINDOWS_README.txt" | sed 's/$/\r/' > "$STAGE/D4R_WINDOWS_README.txt"
 cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r/nvngx.dll"
 cp "$ROOT/build/windows/nvcuda.dll" "$STAGE/d4r/nvcuda.dll"
@@ -59,7 +55,7 @@ for f in "$D4R_WIN_ZLUDA"/*LICENSE*; do [[ -f "$f" ]] && cp "$f" "$L/"; done
   printf 'd4r source: %s\r\n' "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
   printf 'ZLUDA: https://github.com/vosen/ZLUDA at %s with d4r'"'"'s patches/zluda\r\n' \
     "$(cat "$D4R_WIN_ZLUDA/ZLUDA_COMMIT.txt" 2>/dev/null || echo unknown)"
-  printf 'nvapi64.dll, d4r\\nvngx.dll, d4r\\nvcuda.dll, d4r\\d4r-manifest.exe, d4r\\tools\\d4r-harness.exe: d4r (tools/)\r\n'
+  printf 'nvapi64.dll, version.dll, d4r\\nvngx.dll, d4r\\nvcuda.dll, d4r\\d4r-manifest.exe, d4r\\tools\\d4r-harness.exe: d4r (tools/)\r\n'
   printf 'd4r\\kernels: d4r'"'"'s native network kernels (kernels/), built with ROCm\r\n'
 } > "$STAGE/d4r/source/SOURCES.txt"
 
