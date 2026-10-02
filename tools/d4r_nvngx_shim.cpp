@@ -38,6 +38,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <vulkan/vulkan_core.h>
+#include "d4r_d3d12_convert.h"
 #include "d4r_d3d12_inline.h"
 
 #include <algorithm>
@@ -2574,7 +2575,24 @@ struct VramCopy
     bool convert = false; // blit to/from the plane's canonical format
     UINT width = 0, height = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {}; // native Windows: the texture's layout in a buffer
+    DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;               // native Windows with convert: the shader's typed view
+    d4r_convert::Kind kind = d4r_convert::Kind::Color;
 };
+
+// Native Windows: the compute-shader conversions (tools/d4r_d3d12_convert.h), set up on first need.
+static d4r_convert::Converter g_convert;
+static bool convert_ready()
+{
+    static std::once_flag once;
+    static bool ready = false;
+    std::call_once(once, [] {
+        std::string error;
+        ready = g_convert.init(g.device, error);
+        logf("VRAM interop: format conversion shaders %s%s", ready ? "ready" : "unavailable: ",
+             ready ? "" : error.c_str());
+    });
+    return ready;
+}
 
 // Row pitch of a plane or the result in its shared buffer: tight for Vulkan copies, 256-byte aligned for
 // D3D12's buffer footprints.
@@ -2657,15 +2675,25 @@ static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& 
         const bool canonical = output ? desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                                             desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
                                       : canonical_input(plane, desc.Format);
-        if (!canonical)
-            return false;
-        UINT64 total = 0;
-        g.device->GetCopyableFootprints(&desc, 0, 1, 0, &copy.footprint, nullptr, nullptr, &total);
         copy.resource = resource;
         copy.width = static_cast<UINT>(desc.Width);
         copy.height = desc.Height;
-        copy.convert = false;
-        return true;
+        copy.convert = !canonical;
+        if (canonical)
+        {
+            UINT64 total = 0;
+            g.device->GetCopyableFootprints(&desc, 0, 1, 0, &copy.footprint, nullptr, nullptr, &total);
+            return true;
+        }
+        // other formats: a compute shader converts through a typed view
+        using d4r_convert::Kind;
+        copy.kind = output || plane == Plane::Color ? Kind::Color : plane == Plane::Motion ? Kind::Motion : Kind::Scalar;
+        copy.view = output ? d4r_convert::output_view(desc.Format)
+                           : d4r_convert::input_view(copy.kind, plane == Plane::Exposure, desc.Format);
+        if (copy.view == DXGI_FORMAT_UNKNOWN || !convert_ready())
+            return false;
+        return output ? (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 && g_convert.can_store(copy.view)
+                      : (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 && g_convert.can_read(copy.view);
     }
     UINT64 handle = 0, offset = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -2738,9 +2766,16 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
         // the shared buffers are in COMMON state, which copies promote implicitly
         for (int index = 0; index < count; ++index)
         {
-            const D3D12_TEXTURE_COPY_LOCATION source = texture_location(copies[index].resource);
+            const VramCopy& copy = copies[index];
+            if (copy.convert)
+            {
+                g_convert.record_input(list, copy.resource, copy.view, copy.kind, slot.vram[index].d3d12,
+                                       static_cast<uint32_t>(slot.host[index].rowBytes), copy.width, copy.height);
+                continue;
+            }
+            const D3D12_TEXTURE_COPY_LOCATION source = texture_location(copy.resource);
             const D3D12_TEXTURE_COPY_LOCATION destination =
-                buffer_location(slot.vram[index].d3d12, copies[index], slot.host[index].rowBytes);
+                buffer_location(slot.vram[index].d3d12, copy, slot.host[index].rowBytes);
             list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         }
         if (feature.gpuWait)
@@ -2825,6 +2860,13 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
 {
     if (g_vk.native)
     {
+        if (copy.convert)
+        {
+            g_convert.record_output(list, buffer.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
+                                    static_cast<uint32_t>(vram_output_pitch(copy.width)), copy.resource, copy.view,
+                                    copy.width, copy.height);
+            return true;
+        }
         const D3D12_TEXTURE_COPY_LOCATION destination = texture_location(copy.resource);
         const D3D12_TEXTURE_COPY_LOCATION source = buffer_location(buffer.d3d12, copy, vram_output_pitch(copy.width));
         list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
@@ -2933,6 +2975,13 @@ static void record_inline_output(ID3D12GraphicsCommandList* list, Feature& featu
     const size_t pitch = vram_output_pitch(output.width);
     g_inline.record(list, feature.inlineStatus.d3d12, slots, feature.inlinePresent.d3d12, frame,
                     pitch * output.height, inline_max_spins());
+    if (output.convert)
+    {
+        g_convert.record_output(list, feature.inlinePresent.d3d12, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_COMMON, static_cast<uint32_t>(pitch), output.resource, output.view,
+                                output.width, output.height);
+        return;
+    }
     const D3D12_TEXTURE_COPY_LOCATION destination = texture_location(output.resource);
     const D3D12_TEXTURE_COPY_LOCATION source = buffer_location(feature.inlinePresent.d3d12, output, pitch);
     list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
@@ -4973,6 +5022,18 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                                 g.cu.registerLinearTexture != nullptr;
         if (feature->linearInputs)
             logf("linear inputs: NGX samples the interop buffers directly");
+        if (p.vram && g_vk.native)
+        {
+            static const char* const names[4] = {"colour", "depth", "motion", "exposure"};
+            std::string converted;
+            for (int index = 0; index < inputCount; ++index)
+                if (vramInputs[index].convert)
+                    converted += std::string(converted.empty() ? "" : ", ") + names[index];
+            if (vramOutput.convert)
+                converted += std::string(converted.empty() ? "" : ", ") + "output";
+            if (!converted.empty())
+                logf("VRAM interop: converting %s on the GPU (formats other than DLSS's own)", converted.c_str());
+        }
         logf("VRAM interop %s for this feature%s%s", p.vram ? "on" : "off",
              feature->split ? (g_vk.native ? ", presenting each frame's own result (GPU-side wait in the game's "
                                              "command list)"
@@ -5020,19 +5081,21 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
-        if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
-                                                               vramInputs[0].width, vramInputs[0].height,
-                                                               VK_FORMAT_R16G16B16A16_SFLOAT))
+        // Vulkan blits convert through intermediate images; native Windows' shaders need none
+        const bool blits = !g_vk.native;
+        if (blits && vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
+                                                                        vramInputs[0].width, vramInputs[0].height,
+                                                                        VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
+        if (blits && vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
                                                                vramInputs[2].width, vramInputs[2].height,
                                                                VK_FORMAT_R16G16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (inputCount == 4 && vramInputs[3].convert &&
+        if (blits && inputCount == 4 && vramInputs[3].convert &&
             !ensure_conversion_image(*feature, feature->exposureConversion,
                                      vramInputs[3].width, vramInputs[3].height, VK_FORMAT_R32_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
+        if (blits && vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
                                                              vramOutput.width, vramOutput.height,
                                                              VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;

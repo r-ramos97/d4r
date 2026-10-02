@@ -99,10 +99,16 @@ Where the inputs and the result go between the game and DLSS depends on the driv
   with `D3D12_HEAP_FLAG_SHARED`, the bridge maps them into CUDA (`d4rImportWin32Memory`), and the copies are
   `CopyTextureRegion` calls on the game's command list, into rows aligned to 256 bytes as D3D12's buffer
   footprints require. It is the same pipeline as the Proton VRAM path, with D3D12 copies instead of Vulkan
-  ones. D3D12 has no blit, so a feature uses it only when the game's resources are in DLSS's own formats:
-  RGBA16F colour and output, 32-bit depth (`D32_FLOAT`, `D32_FLOAT_S8X24` and their typeless forms), RG16F
-  motion vectors, R32F exposure. At startup the shim maps one small buffer; if HIP refuses it, it logs why
-  and stays on host memory.
+  ones. Resources in DLSS's own formats (RGBA16F colour and output, 32-bit depth, RG16F motion vectors, R32F
+  exposure) are copied as they are. D3D12 has no blit, so the others are converted by compute shaders on the
+  game's command list (`tools/d4r_d3d12_convert.h`), the way the host path converts them: colour in RGBA8 or
+  BGRA8 (typeless), RGB10A2, R11G11B10 or RGBA32F; D24 and D16 depth; RG32F or RGBA16F motion; R16F, RGBA16F
+  or RGBA32F exposure; and outputs in RGBA8, BGRA8, RGB10A2, R11G11B10 or RGBA32F (the output must allow
+  unordered access, which DLSS requires anyway). The shaders read and store through typed views in a descriptor
+  heap of the shim's, which they bind on the game's command list as a DLSS evaluation may; Windows' CI runs
+  every conversion on WARP against the host path's formulas (`tests/windows/convert_test.cpp`). Fully typed
+  sRGB colour cannot be viewed as UNORM and stays on the host path. At startup the shim maps one small buffer;
+  if HIP refuses it, it logs why and stays on host memory.
 - **Host memory** otherwise: readback buffers in, an upload buffer out; about 55 MB per frame cross PCIe at
   1440p Quality.
 
@@ -187,4 +193,5 @@ ones), `d4r\interop-report.txt`, `OptiScaler.log`.
 - **VRAM interop on AMD's driver.** The shared-buffer path and the probe are written against the HIP and D3D12
   documentation and tested with mocks; the probe's report on real hardware says whether the import works, and
   a shared fence or the marker wait would let DLSS start on the GPU without the CPU polling the frame marker.
-  Colour or output in other formats (R11G11B10, RGBA8, RGB10A2) would need a compute-shader conversion.
+  The format conversions bind a descriptor heap on the game's command list; a game that does not restore its
+  heaps after DLSS would be affected (as by DLSS itself on NVIDIA hardware).
