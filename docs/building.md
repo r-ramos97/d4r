@@ -143,6 +143,9 @@ Run `bash scripts/build_release_glibc241.sh` inside the container. The script ch
 
 ## Checks
 
-- `scripts/check_environment.sh` lists the tools, GPU and Proton builds it finds.
+- `scripts/check_environment.sh` lists the tools, GPUs (with the one d4r uses) and Proton builds it finds.
+- `python3 -m unittest discover -s tests -v` runs the CPU tests: configuration, native kernel selection and
+  `packaging/d4r-check.sh`. CI (`.github/workflows/ci.yml`) runs them with ShellCheck and builds the shim and
+  the bridge on every push; the native kernels need ROCm and are not built there.
 - The D3D12 harness (`scripts/run_d3d12_dlss_harness_proton.sh`) drives DLSS outside a game.
 - Native kernels have their own validation path; see [native-kernels.md](native-kernels.md).

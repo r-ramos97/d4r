@@ -1,0 +1,43 @@
+# CPU-only checks: configuration and install-check tests, shell scripts, and the two Windows-side
+# components (the NGX shim and the Wine CUDA bridge). Native kernels need ROCm and are not built here.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests and script checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configuration and install-check tests
+        run: python3 -m unittest discover -s tests -v
+      - name: ShellCheck (errors)
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          shellcheck -S error scripts/*.sh kernels/build.sh kernels/tex/build_tex.sh packaging/d4r-check.sh
+      - name: Python syntax
+        run: python3 -m compileall -q kernels packaging scripts tests tools
+
+  windows-components:
+    name: Build the NGX shim and the Wine CUDA bridge
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64, clang-cl, Vulkan headers and Wine's winegcc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix clang-tools-18 libvulkan-dev wine64-tools
+      - name: NGX shim (build/d4r_nvngx.dll)
+        run: bash scripts/build_d4r_nvngx_shim.sh
+        env:
+          CLANG_CL: /usr/lib/llvm-18/bin/clang-cl
+          MINGW_CXX: x86_64-w64-mingw32-g++-posix
+      - name: Wine CUDA bridge (build/wine-nvcuda)
+        run: bash scripts/build_wine_nvcuda_bridge.sh

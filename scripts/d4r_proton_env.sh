@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Source this to export the environment a Proton process needs to run
 # official DLSS on AMD through d4r (ZLUDA + Wine CUDA bridge + NGX shim).
 # Paths can be overridden before sourcing.
