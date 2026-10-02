@@ -252,6 +252,9 @@ class WindowsNativeBridgeTests(unittest.TestCase):
              ["converting colour, output on the GPU", "VRAM interop on for this feature"], False),
             ("same-frame results", {"D4R_SHIM_SPLIT_FRAME": "1", "D4R_SHIM_MAX_IN_FLIGHT": "3"},
              ["GPU-side wait in the game's command list"], False),
+            ("same-frame results, RGBA8 (the present buffer through the output conversion)",
+             {"D4R_SHIM_SPLIT_FRAME": "1", "D4R_SHIM_MAX_IN_FLIGHT": "3", "D4R_HARNESS_RGBA8": "1"},
+             ["converting colour, output on the GPU", "GPU-side wait in the game's command list"], False),
         ]
         for name, extra, lines, data in scenarios:
             with self.subTest(name):
