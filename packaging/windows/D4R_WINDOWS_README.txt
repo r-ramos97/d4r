@@ -38,7 +38,10 @@ Install
    It checks everything, writes the native kernel manifests from your nvngx_dlss.dll (310.7 or 310.9) and
    puts d4r's settings in OptiScaler.ini (the original stays as OptiScaler.ini.d4r-backup). Fix what it
    reports and run it again until it says everything is in place.
-5. Start the game and choose DLSS in its graphics settings.
+5. Optional, but the best first test: run DLSS without the game, on synthetic frames:
+       powershell -ExecutionPolicy Bypass -File d4r\test-dlss.ps1
+   It shows each step and writes d4r\test-output.raw.bmp, the last frame DLSS produced.
+6. Start the game and choose DLSS in its graphics settings.
 
 The first time DLSS starts the game can freeze for a minute or more while DLSS's GPU kernels are
 compiled. ZLUDA caches them in %LOCALAPPDATA%\zluda, so later starts are quick.

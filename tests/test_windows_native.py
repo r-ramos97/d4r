@@ -164,6 +164,7 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         shutil.copy(self.binaries / "_nvngx.dll", self.d4r / "ngx" / "_nvngx.dll")
         exe = self.d4r.parent / "shim_test.exe"  # in the game's folder, which holds d4r\\
         shutil.copy(self.binaries / "shim_test.exe", exe)
+        shutil.copy(self.binaries / "nvapi64.dll", self.d4r.parent / "nvapi64.dll")
         result = self.run_program(exe, windows_path(self.d4r),
                                   extra_env={"D4R_PLATFORM": "windows", "D4R_TEST_MODULE": windows_path(self.ptx)})
         log = (self.d4r / "d4r_nvngx.log").read_text(errors="replace") if (self.d4r / "d4r_nvngx.log").exists() else ""
@@ -171,6 +172,7 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         self.assertIn("native Windows", log)
         self.assertIn("D4R_ZLUDA_LIBCUDA=", log)
         self.assertIn("zluda_nvcuda.dll", log)
+        self.assertRegex(log, r"NVAPI for NGX: .*\\game\\d4r\\\.\.\\nvapi64\.dll|NVAPI for NGX: .*\\game\\nvapi64\.dll")
 
 
 if __name__ == "__main__":

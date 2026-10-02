@@ -191,6 +191,58 @@ static void update_texture(ID3D12Resource* texture, const void* data, UINT rowBy
     upload(texture, data, rowBytes, currentState);
 }
 
+// A viewable copy of the output: OUTPUT_RAW.bmp, 8-bit sRGB-ish (clamped, gamma 2.2) from RGBA16F or RGBA8.
+static void write_bmp_preview(const std::string& path, const std::vector<uint8_t>& pixels, UINT width, UINT height,
+                              bool rgba8)
+{
+    auto half = [](uint16_t bits) {
+        const uint32_t sign = (bits & 0x8000u) << 16, exponent = (bits >> 10) & 0x1f, mantissa = bits & 0x3ff;
+        uint32_t value;
+        if (exponent == 0)
+            value = mantissa == 0 ? sign : std::bit_cast<uint32_t>(std::ldexp(static_cast<float>(mantissa), -24)) | sign;
+        else if (exponent == 31)
+            value = sign | 0x7f800000u | (mantissa << 13);
+        else
+            value = sign | ((exponent + 112) << 23) | (mantissa << 13);
+        return std::bit_cast<float>(value);
+    };
+    const UINT stride = (width * 3 + 3) & ~3u;
+    std::vector<uint8_t> bmp(54 + static_cast<size_t>(stride) * height, 0);
+    auto put32 = [&](size_t offset, uint32_t value) { std::memcpy(bmp.data() + offset, &value, 4); };
+    bmp[0] = 'B', bmp[1] = 'M';
+    put32(2, static_cast<uint32_t>(bmp.size()));
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, width);
+    put32(22, height);
+    bmp[26] = 1, bmp[28] = 24;
+    put32(34, static_cast<uint32_t>(bmp.size() - 54));
+    for (UINT y = 0; y < height; ++y)
+        for (UINT x = 0; x < width; ++x)
+            for (int c = 0; c < 3; ++c)
+            {
+                float value;
+                if (rgba8)
+                    value = pixels[(static_cast<size_t>(y) * width + x) * 4 + c] / 255.0f;
+                else
+                {
+                    uint16_t bits;
+                    std::memcpy(&bits, pixels.data() + (static_cast<size_t>(y) * width + x) * 8 + c * 2, 2);
+                    value = std::pow(std::clamp(half(bits), 0.0f, 1.0f), 1.0f / 2.2f);
+                }
+                if (!(value >= 0.0f))
+                    value = 0.0f;
+                // BMP rows run bottom-up, pixels as BGR
+                bmp[54 + static_cast<size_t>(height - 1 - y) * stride + x * 3 + (2 - c)] =
+                    static_cast<uint8_t>(std::lround(std::min(value, 1.0f) * 255.0f));
+            }
+    if (FILE* file = std::fopen(path.c_str(), "wb"))
+    {
+        std::fwrite(bmp.data(), 1, bmp.size(), file);
+        std::fclose(file);
+    }
+}
+
 static std::vector<uint8_t> read_back(ID3D12Resource* texture, D3D12_RESOURCE_STATES state, UINT rowBytes)
 {
     D3D12_RESOURCE_DESC desc;
@@ -884,6 +936,8 @@ int main(int argc, char** argv)
     for (uint8_t value : output)
         nonzero += value != 0;
     std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
+    write_bmp_preview(std::string(argv[2]) + ".bmp", output, outWidth, outHeight, rgba8);
+    std::printf("preview: %s.bmp\n", argv[2]);
 
     // D4R_HARNESS_RECREATE=N: N more release/create cycles at alternating render sizes (as when a game's DLSS
     // quality setting changes), a few evaluations each, logging this process's VRAM to find leaks per cycle.

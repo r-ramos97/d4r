@@ -1293,6 +1293,21 @@ static bool load_libraries()
                          getenv(name.c_str()) != nullptr && value != getenv(name.c_str()) ? " (set by the environment)" : "");
         }
     }
+    // On native Windows NGX reads the GPU's architecture through NVAPI, which an AMD PC lacks: d4r's
+    // nvapi64.dll in the game folder (or the d4r folder) answers it. OptiScaler usually loaded it already;
+    // otherwise (the D3D12 harness, or OptiScaler with its NVAPI override) it is loaded here, before the core.
+    if (g_portable.active && !g_portable.wine)
+    {
+        HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+        for (const wchar_t* candidate : {L"\\..\\nvapi64.dll", L"\\nvapi64.dll"})
+            if (nvapi == nullptr && file_exists(g_portable.dir + candidate))
+                nvapi = LoadLibraryW((g_portable.dir + candidate).c_str());
+        wchar_t nvapiPath[MAX_PATH] = L"none";
+        if (nvapi != nullptr)
+            GetModuleFileNameW(nvapi, nvapiPath, MAX_PATH);
+        logf("NVAPI for NGX: %ls%s", nvapiPath,
+             nvapi == nullptr ? " (put d4r's nvapi64.dll in the game folder: NGX needs an Ada GPU identity)" : "");
+    }
     wchar_t corePath[MAX_PATH] = {};
     length = GetEnvironmentVariableW(L"D4R_NGX_CORE", corePath, MAX_PATH);
     if (length == 0 || length >= MAX_PATH)
