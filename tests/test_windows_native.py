@@ -15,6 +15,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CC = os.environ.get("MINGW_CC", "x86_64-w64-mingw32-gcc")
+CLANG_CL = os.environ.get("CLANG_CL") or shutil.which("clang-cl") or next(
+    (str(path) for path in sorted(Path("/usr/lib").glob("llvm-*/bin/clang-cl"), reverse=True)), None)
 ON_WINDOWS = sys.platform == "win32"
 WINE = None if ON_WINDOWS else shutil.which("wine") or shutil.which("wine64")
 
@@ -94,10 +96,11 @@ class WindowsNativeBridgeTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def run_test_program(self):
+    def run_program(self, *args, extra_env=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("D4R_", "HIP_PATH"))}
         env["HIP_PATH"] = windows_path(self.work / "hip")
-        command = [str(self.exe), windows_path(self.d4r), windows_path(self.cache), windows_path(self.ptx)]
+        env.update(extra_env or {})
+        command = [str(arg) for arg in args]
         if not ON_WINDOWS:
             env.setdefault("WINEPREFIX", str(Path.home() / ".cache" / "d4r-test-wineprefix"))
             env["WINEDEBUG"] = "-all"
@@ -105,13 +108,43 @@ class WindowsNativeBridgeTests(unittest.TestCase):
             command.insert(0, WINE)
         return subprocess.run(command, env=env, text=True, capture_output=True, timeout=600)
 
-    def test_bridge_against_mock_zluda_and_hip(self):
-        result = self.run_test_program()
+    def run_test_program(self):
+        return self.run_program(self.exe, windows_path(self.d4r), windows_path(self.cache), windows_path(self.ptx))
+
+    def assert_all_pass(self, result):
         lines = [line for line in result.stdout.splitlines() if line.startswith(("PASS", "FAIL"))]
         self.assertTrue(lines, result.stdout + result.stderr)
         failed = [line for line in lines if line.startswith("FAIL")]
         self.assertEqual(failed, [], result.stdout + result.stderr[-4000:])
         self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_bridge_against_mock_zluda_and_hip(self):
+        self.assert_all_pass(self.run_test_program())
+
+    @unittest.skipUnless(CLANG_CL, "the shim build needs clang-cl")
+    def test_shim_initialises_ngx_through_the_bridge(self):
+        """A portable install on native Windows: OptiScaler loads d4r\\nvngx.dll, which reads d4r.ini and
+        initialises the (mock) NGX core, whose CUDA calls reach the (mock) ZLUDA through the bridge."""
+        env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
+        subprocess.run(["bash", str(ROOT / "scripts" / "build_d4r_nvngx_shim.sh")], env=env, check=True,
+                       capture_output=True, text=True)
+        shutil.copy(ROOT / "build" / "d4r_nvngx.dll", self.d4r / "nvngx.dll")
+        shutil.copy(ROOT / "packaging" / "d4r.ini", self.d4r / "d4r.ini")
+        (self.d4r / "nvngx_dlss.dll").write_bytes(b"placeholder")
+        (self.d4r / "ngx").mkdir(exist_ok=True)
+        windows = ROOT / "tests" / "windows"
+        subprocess.run([CC, "-O2", "-Wall", "-Wextra", "-Werror", "-shared", str(windows / "mock_ngx_core.c"),
+                        "-o", str(self.d4r / "ngx" / "_nvngx.dll")], check=True, capture_output=True, text=True)
+        exe = self.d4r.parent / "shim_test.exe"  # the game's folder, which holds d4r\\
+        subprocess.run([CC, "-O2", "-Wall", "-Wextra", "-Werror", str(windows / "shim_test.c"), "-o", str(exe)],
+                       check=True, capture_output=True, text=True)
+        result = self.run_program(exe, windows_path(self.d4r),
+                                  extra_env={"D4R_PLATFORM": "windows", "D4R_TEST_MODULE": windows_path(self.ptx)})
+        log = (self.d4r / "d4r_nvngx.log").read_text(errors="replace") if (self.d4r / "d4r_nvngx.log").exists() else ""
+        self.assert_all_pass(result)
+        self.assertIn("native Windows", log)
+        self.assertIn("D4R_ZLUDA_LIBCUDA=", log)
+        self.assertIn("zluda_nvcuda.dll", log)
 
 
 if __name__ == "__main__":

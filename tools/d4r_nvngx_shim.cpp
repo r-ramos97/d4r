@@ -278,8 +278,11 @@ static HMODULE g_selfModule = nullptr;
 struct PortableInstall
 {
     bool active = false;
+    bool wine = true;                                         // Proton; false: native Windows (docs/windows.md)
     std::wstring dir;                                         // the d4r folder
-    std::string unixDir;                                      // the same folder as a Linux path
+    std::string unixDir;                                      // the same folder as a Linux path (Wine)
+    std::string bridgeDir;                                    // the folder as the bridge reads it: unixDir, or
+                                                              // the Windows path on native Windows
     std::vector<std::pair<std::string, std::string>> unixEnv; // for the bridge's d4rSetEnv
     std::vector<std::string> notes;                           // logged once the log is open
 };
@@ -407,6 +410,35 @@ static std::string unix_path(const std::wstring& path)
     return text;
 }
 
+// Proton or native Windows. Under Wine, ZLUDA and ROCm run on the Linux side behind the Wine nvcuda bridge
+// and take Linux paths; on native Windows the bridge, ZLUDA and HIP are Windows DLLs in this process.
+// D4R_PLATFORM=windows or =wine overrides the check (the tests run the Windows mode under Wine).
+static bool running_under_wine()
+{
+    static const bool wine = [] {
+        char platform[16] = {};
+        const DWORD length = GetEnvironmentVariableA("D4R_PLATFORM", platform, sizeof(platform));
+        if (length > 0 && length < sizeof(platform))
+            return _stricmp(platform, "wine") == 0;
+        return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    }();
+    return wine;
+}
+
+// A Windows path for the native bridge, which opens files through the C runtime (the ANSI code page); ""
+// when the path has characters that code page lacks.
+static std::string narrow_path(const std::wstring& path)
+{
+    BOOL lossy = FALSE;
+    const int length = WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, &lossy);
+    if (length <= 0 || lossy)
+        return std::string();
+    std::string text(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, text.data(), length, nullptr, nullptr);
+    text.resize(static_cast<size_t>(length - 1));
+    return text;
+}
+
 static std::wstring widen(const std::string& text)
 {
     std::wstring wide(text.size() + 1, L'\0');
@@ -480,9 +512,15 @@ static void load_portable_config()
     const std::vector<IniEntry> ini = parse_ini(text);
     g_portable.active = true;
     g_portable.dir = dir;
-    g_portable.unixDir = unix_path(dir);
-    if (g_portable.unixDir.empty())
-        g_portable.notes.push_back("cannot map the d4r folder to a Linux path (not running under Wine?)");
+    g_portable.wine = running_under_wine();
+    g_portable.unixDir = g_portable.wine ? unix_path(dir) : std::string();
+    g_portable.bridgeDir = g_portable.wine ? g_portable.unixDir : narrow_path(dir);
+    if (g_portable.bridgeDir.empty())
+        g_portable.notes.push_back(g_portable.wine
+                                       ? "cannot map the d4r folder to a Linux path (not running under Wine?)"
+                                       : "the d4r folder's path has characters this system's code page lacks; "
+                                         "move the game to a folder whose path has none");
+    const char* separator = g_portable.wine ? "/" : "\\";
 
     // Files of the install; NGX looks for nvngx_dlss.dll next to this DLL.
     portable_set(L"D4R_NVCUDA_BRIDGE", dir + L"\\nvcuda.dll");
@@ -494,16 +532,37 @@ static void load_portable_config()
     portable_set(L"D4R_SHIM_LOG", log.empty() ? dir + L"\\d4r_nvngx.log" : portable_path(log));
     portable_set("D4R_CUDA_CAPTURE", "0"); // the bridge would otherwise save every DLSS module it loads
 
+    // ZLUDA: libcuda.so on Linux; on Windows its nvcuda.dll, renamed so that NGX's LoadLibrary("nvcuda.dll")
+    // keeps finding the bridge
     const std::string zluda = ini_value(ini, "paths", "ZludaDir");
-    portable_set_unix("D4R_ZLUDA_LIBCUDA", (zluda.empty() ? g_portable.unixDir + "/zluda" : zluda) + "/libcuda.so");
-    // The release's bundled ROCm runtime unless d4r.ini names another
+    if (g_portable.wine)
+        portable_set_unix("D4R_ZLUDA_LIBCUDA", (zluda.empty() ? g_portable.unixDir + "/zluda" : zluda) + "/libcuda.so");
+    else if (!g_portable.bridgeDir.empty())
+        portable_set_unix("D4R_ZLUDA_LIBCUDA",
+                          (zluda.empty() ? g_portable.bridgeDir + "\\zluda" : narrow_path(portable_path(zluda))) +
+                              "\\zluda_nvcuda.dll");
+    // The release's bundled ROCm (Linux) or HIP (Windows) runtime unless d4r.ini names another; on Windows
+    // the bridge otherwise uses the HIP SDK's HIP_PATH, then the driver's copy.
     const std::string rocm = ini_value(ini, "paths", "RocmDir");
     if (!rocm.empty())
-        portable_set_unix("D4R_ROCM_DIR", rocm);
-    else if (!g_portable.unixDir.empty() && GetFileAttributesW((dir + L"\\rocm\\lib").c_str()) != INVALID_FILE_ATTRIBUTES)
-        portable_set_unix("D4R_ROCM_DIR", g_portable.unixDir + "/rocm");
+        portable_set_unix("D4R_ROCM_DIR", g_portable.wine ? rocm : narrow_path(portable_path(rocm)));
+    else if (!g_portable.bridgeDir.empty() &&
+             GetFileAttributesW((dir + (g_portable.wine ? L"\\rocm\\lib" : L"\\rocm\\bin")).c_str()) !=
+                 INVALID_FILE_ATTRIBUTES)
+        portable_set_unix("D4R_ROCM_DIR", g_portable.bridgeDir + separator + "rocm");
+    // Where the bridge serves verified native kernels from (and ZLUDA keeps its cache, on Linux)
     const std::string cache = ini_value(ini, "paths", "CacheDir");
-    portable_set_unix("D4R_ZLUDA_CACHE_HOME", cache.empty() ? "~/.cache/d4r" : cache);
+    if (g_portable.wine)
+        portable_set_unix("D4R_ZLUDA_CACHE_HOME", cache.empty() ? "~/.cache/d4r" : cache);
+    else
+    {
+        wchar_t local[MAX_PATH] = {};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+        const std::wstring base = length > 0 && length < MAX_PATH ? std::wstring(local) : g_portable.dir;
+        const std::string home = narrow_path(cache.empty() ? base + L"\\d4r" : portable_path(cache));
+        if (!home.empty())
+            portable_set_unix("D4R_ZLUDA_CACHE_HOME", home);
+    }
 
     std::string model = ini_value(ini, "dlss", "Model");
     if (ascii_lower(model) != "game")
@@ -534,8 +593,8 @@ static void load_portable_config()
     const bool nativeOn = native.empty() || native == "on" || native == "true" || native == "1" || native == "fast";
     if (!nativeOn && native != "off" && native != "false" && native != "0")
         g_portable.notes.push_back("d4r.ini: [Kernels] NativeKernels must be on or off, not '" + native + "'");
-    if (nativeOn && !g_portable.unixDir.empty())
-        portable_set_unix("D4R_ZLUDA_NATIVE_DIR", g_portable.unixDir + "/kernels");
+    if (nativeOn && !g_portable.bridgeDir.empty())
+        portable_set_unix("D4R_ZLUDA_NATIVE_DIR", g_portable.bridgeDir + separator + "kernels");
     portable_set_unix("D4R_ZLUDA_WMMA", ini_flag(ini, "kernels", "Wmma", 1) ? "1" : "0");
     portable_set_unix("D4R_ZLUDA_WMMA_FP8", ini_flag(ini, "kernels", "Fp8Wmma", 1) ? "1" : "0");
     // RDNA4's native FP8 WMMA; ZLUDA and the bridge ignore it on other GPUs
@@ -1349,8 +1408,11 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     ensure_portable_config();
     if (g_portable.active && !g.core)
     {
-        logf("portable install in %ls (settings from d4r.ini, Linux path %s)", g_portable.dir.c_str(),
-             g_portable.unixDir.c_str());
+        if (g_portable.wine)
+            logf("portable install in %ls (settings from d4r.ini, Linux path %s)", g_portable.dir.c_str(),
+                 g_portable.unixDir.c_str());
+        else
+            logf("portable install in %ls (settings from d4r.ini, native Windows)", g_portable.dir.c_str());
         for (const std::string& note : g_portable.notes)
             logf("d4r: %s", note.c_str());
     }
@@ -2094,7 +2156,11 @@ static void init_vram_interop()
 {
     if (FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), reinterpret_cast<void**>(&g_vk.interop))))
     {
-        logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
+        if (running_under_wine())
+            logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
+        else
+            logf("VRAM interop: not available with a native D3D12 driver yet; inputs and the result go through "
+                 "host memory, and each frame shows the newest finished result (docs/windows.md)");
         return;
     }
     VkInstance instance = VK_NULL_HANDLE;
