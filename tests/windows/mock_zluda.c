@@ -2,6 +2,7 @@
    memory instead of a GPU, and counters the test reads through mock_zluda_stats. */
 #include <windows.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -23,14 +24,23 @@ EXPORT CUresult cuInit(unsigned int flags)
         wmma_fp8_native_at_init[0] = '\0';
     return 0;
 }
-EXPORT CUresult cuDeviceGetCount(int* count) { *count = 1; return 0; }
-EXPORT CUresult cuDeviceGet(int* device, int ordinal) { *device = ordinal; return 0; }
+EXPORT CUresult cuDeviceGetCount(int* count) { *count = 3; return 0; } /* mock_hip's GPUs */
+EXPORT CUresult cuDeviceGet(int* device, int ordinal)
+{
+    if (ordinal < 0 || ordinal >= 3)
+        return 101;
+    *device = ordinal;
+    return 0;
+}
+static int context_device = -1;
 EXPORT CUresult cuCtxCreate_v2(void** context, unsigned int flags, int device)
 {
-    (void)flags, (void)device;
+    (void)flags;
+    context_device = device;
     *context = (void*)0x1234;
     return 0;
 }
+EXPORT int mock_zluda_context_device(void) { return context_device; }
 EXPORT CUresult cuCtxSynchronize(void) { ++sync_calls; return 0; }
 EXPORT CUresult cuModuleLoadData(void** module, const void* image)
 {
@@ -64,6 +74,40 @@ EXPORT CUresult cuDeviceGetLuid(char* luid, unsigned int* mask, int device)
     for (int i = 0; i < 8; ++i)
         luid[i] = (char)(i + 1);
     *mask = 1;
+    return 0;
+}
+/* host memory stands in for device memory (the interop probe's copies) */
+EXPORT CUresult cuMemcpyDtoH_v2(void* host, uint64_t device, size_t bytes)
+{
+    memcpy(host, (const void*)(uintptr_t)device, bytes);
+    return 0;
+}
+EXPORT CUresult cuMemcpyHtoD_v2(uint64_t device, const void* host, size_t bytes)
+{
+    memcpy((void*)(uintptr_t)device, host, bytes);
+    return 0;
+}
+EXPORT CUresult cuMemcpyDtoD_v2(uint64_t destination, uint64_t source, size_t bytes)
+{
+    memmove((void*)(uintptr_t)destination, (const void*)(uintptr_t)source, bytes);
+    return 0;
+}
+EXPORT CUresult cuMemsetD32_v2(uint64_t device, unsigned int value, size_t count)
+{
+    uint32_t* words = (uint32_t*)(uintptr_t)device;
+    for (size_t i = 0; i < count; ++i)
+        words[i] = value;
+    return 0;
+}
+EXPORT CUresult cuMemsetD32Async(uint64_t device, unsigned int value, size_t count, void* stream)
+{
+    (void)stream;
+    return cuMemsetD32_v2(device, value, count);
+}
+EXPORT CUresult cuStreamQuery(void* stream) { (void)stream; return 0; }
+EXPORT CUresult cuDeviceGetName(char* name, int length, int device)
+{
+    snprintf(name, (size_t)length, "mock ZLUDA device %d", device);
     return 0;
 }
 EXPORT CUresult cuGetErrorString(CUresult code, const char** message)

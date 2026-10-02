@@ -1,7 +1,8 @@
 /* Loads the native Windows nvcuda bridge the way the NGX shim and NVIDIA's NGX core do, against a mock
    ZLUDA (zluda/zluda_nvcuda.dll) and a mock HIP SDK (HIP_PATH\bin\amdhip64_7.dll), and checks what the
    bridge adds: the GPU and native kernel set it picks, PTX-hash verification of native kernels, NGX sync
-   elision, cuGetProcAddress and the d4rSetEnv hand-over. tests/test_windows_native.py prepares the folder.
+   elision, cuGetProcAddress, the d4rSetEnv hand-over, the single CUDA device NGX sees and the D3D12 interop
+   exports. tests/test_windows_native.py prepares the folder.
 
    usage: bridge_test.exe D4R_DIR CACHE_DIR MODULE.ptx */
 #include <windows.h>
@@ -17,6 +18,15 @@ typedef int(WINAPI* SyncFn)(void);
 typedef int(WINAPI* GetProcFn)(const char*, void**, int, uint64_t);
 typedef const char*(WINAPI* LoadErrorFn)(void);
 typedef void (*StatsFn)(int*, int*, int*, int*, const char**, const char**);
+typedef int(WINAPI* DeviceCountFn)(int*);
+typedef int(WINAPI* DeviceGetFn)(int*, int);
+typedef int(WINAPI* ImportMemoryFn)(void*, uint32_t, uint64_t, uint64_t*, void**);
+typedef int(WINAPI* ImportSemaphoreFn)(void*, uint32_t, void**);
+typedef int(WINAPI* SemaphoreValueFn)(void*, uint64_t);
+typedef int(WINAPI* ReleaseFn)(void*);
+typedef int (*ContextDeviceFn)(void);
+typedef void (*InteropFn)(int*, void**, uint64_t*, unsigned int*, uint64_t*, int*, int*, void**, uint64_t*, uint64_t*,
+                          void**, int*);
 
 static int failures;
 
@@ -86,6 +96,9 @@ int main(int argc, char** argv)
     setEnv("D4R_ELIDE_NGX_SYNC", "1", 1);
     setEnv("D4R_PREFER_ACCURACY", "0", 1);
     setEnv("D4R_CUDA_CAPTURE", "0", 1);
+    /* the game's D3D12 adapter, which the shim names before NGX starts: the RX 9070 XT, not the larger GPU */
+    setEnv("D4R_CUDA_LUID_LOW", "0x00002000", 1);
+    setEnv("D4R_CUDA_LUID_HIGH", "0x00000000", 1);
     char value[64] = {0};
     GetEnvironmentVariableA("D4R_ELIDE_NGX_SYNC", value, sizeof(value));
     check(strcmp(value, "1") == 0 && getenv("D4R_ELIDE_NGX_SYNC") != NULL, "d4rSetEnv reaches the process", value);
@@ -155,6 +168,52 @@ int main(int argc, char** argv)
     /* a loader that wants System32's CUDA driver (as NVIDIA's own components may) gets the loaded bridge too */
     check(LoadLibraryExA("nvcuda.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32) == bridge,
           "LoadLibraryEx(\"nvcuda.dll\", SEARCH_SYSTEM32) finds the loaded bridge", "");
+
+    /* NGX sees one CUDA device: the HIP GPU of the game's D3D12 adapter */
+    DeviceCountFn deviceCount = (DeviceCountFn)(void*)GetProcAddress(bridge, "cuDeviceGetCount");
+    DeviceGetFn deviceGet = (DeviceGetFn)(void*)GetProcAddress(bridge, "cuDeviceGet");
+    int count = 0, device = -1;
+    check(deviceCount != NULL && deviceCount(&count) == 0 && count == 1, "NGX sees one CUDA device of three GPUs", "");
+    check(deviceGet != NULL && deviceGet(&device, 0) == 0 && device == 1,
+          "CUDA device 0 is the HIP GPU whose LUID is the D3D12 adapter's", "");
+    check(deviceGet != NULL && deviceGet(&device, 1) != 0, "CUDA device 1 does not exist", "");
+    ContextDeviceFn contextDevice = (ContextDeviceFn)(void*)GetProcAddress(zluda, "mock_zluda_context_device");
+
+    /* D3D12 interop: shared NT handles reach HIP with HIP's descriptor layout */
+    ImportMemoryFn importMemory = (ImportMemoryFn)(void*)GetProcAddress(bridge, "d4rImportWin32Memory");
+    ImportSemaphoreFn importSemaphore = (ImportSemaphoreFn)(void*)GetProcAddress(bridge, "d4rImportWin32Semaphore");
+    SemaphoreValueFn waitSemaphore = (SemaphoreValueFn)(void*)GetProcAddress(bridge, "d4rWaitSemaphore");
+    SemaphoreValueFn signalSemaphore = (SemaphoreValueFn)(void*)GetProcAddress(bridge, "d4rSignalSemaphore");
+    ReleaseFn releaseMemory = (ReleaseFn)(void*)GetProcAddress(bridge, "d4rReleaseVulkanMemory");
+    ReleaseFn releaseSemaphore = (ReleaseFn)(void*)GetProcAddress(bridge, "d4rReleaseSemaphore");
+    InteropFn interop = (InteropFn)(void*)GetProcAddress(hip, "mock_hip_interop");
+    check(importMemory && importSemaphore && waitSemaphore && signalSemaphore && releaseMemory && releaseSemaphore &&
+              interop && contextDevice,
+          "interop exports", "missing");
+    if (!(importMemory && importSemaphore && waitSemaphore && signalSemaphore && releaseMemory && releaseSemaphore &&
+          interop && contextDevice))
+        return 1;
+    uint64_t pointer = 0;
+    void *memory = NULL, *semaphore = NULL;
+    check(importMemory((void*)(uintptr_t)0x1234, 5, 1 << 20, &pointer, &memory) == 0 && pointer != 0 && memory != NULL,
+          "d4rImportWin32Memory maps a D3D12 resource", "");
+    check(contextDevice() == 1, "the bridge's own context (created by its first helper) is on that GPU too", "");
+    check(importSemaphore((void*)(uintptr_t)0x5678, 4, &semaphore) == 0 && semaphore != NULL,
+          "d4rImportWin32Semaphore imports a D3D12 fence", "");
+    check(waitSemaphore(semaphore, 7) == 0 && signalSemaphore(semaphore, 8) == 0, "fence wait and signal queue", "");
+    check(releaseMemory(memory) == 0 && releaseSemaphore(semaphore) == 0, "imports release", "");
+    int memoryType, memoryDestroyed, semaphoreType, semaphoreDestroyed;
+    void *memoryHandle, *semaphoreHandle, *waitStream;
+    uint64_t memorySize, mappedSize, waited, signalled;
+    unsigned int memoryFlags;
+    interop(&memoryType, &memoryHandle, &memorySize, &memoryFlags, &mappedSize, &memoryDestroyed, &semaphoreType,
+            &semaphoreHandle, &waited, &signalled, &waitStream, &semaphoreDestroyed);
+    check(memoryType == 5 && memoryHandle == (void*)(uintptr_t)0x1234 && memorySize == 1 << 20 && memoryFlags == 1,
+          "HIP gets a dedicated D3D12 resource import (type 5, handle, size, flags 1)", "");
+    check(mappedSize == 1 << 20, "the whole resource is mapped", "");
+    check(semaphoreType == 4 && semaphoreHandle == (void*)(uintptr_t)0x5678, "HIP gets a D3D12 fence (type 4)", "");
+    check(waited == 7 && signalled == 8 && waitStream == NULL, "fence values on the null stream, where NGX runs", "");
+    check(memoryDestroyed && semaphoreDestroyed, "HIP releases both imports", "");
 
     printf("%d failure(s)\n", failures);
     return failures != 0;

@@ -55,6 +55,7 @@ enum
     CUDA_ERROR_NOT_INITIALIZED = 3,
     CUDA_ERROR_INVALID_VALUE = 1,
     CUDA_ERROR_OUT_OF_MEMORY = 2,
+    CUDA_ERROR_INVALID_DEVICE = 101,
     CUDA_ERROR_NOT_FOUND = 500,
     CUDA_ERROR_NOT_READY = 600,
     CUDA_ERROR_NOT_SUPPORTED = 801,
@@ -464,21 +465,30 @@ static void native_cleanup(void)
         remove_directory(native_served);
 }
 
-/* The gfx target ("gfx1101") of the GPU DLSS runs on, "" when unknown: D4R_GPU_ARCH if set, else the KFD
-   topology's (Windows: HIP's) GPU with the most SIMDs. With an integrated and a discrete GPU (Ryzen 7000/9000 desktops) the
-   first KFD GPU node can be the integrated one, whose kernels would not match the discrete GPU. */
-static void gpu_architecture(char* out, size_t size)
-{
-    out[0] = '\0';
-    const char* forced = getenv("D4R_GPU_ARCH");
-    if (forced != NULL && strncmp(forced, "gfx", 3) == 0)
-    {
-        snprintf(out, size, "%s", forced);
-        return;
-    }
-    unsigned long best_simds = 0;
-    int gpus = 0;
 #ifdef D4R_NATIVE_WINDOWS
+/* HIP on Windows lists every AMD GPU, and a Ryzen 7000/9000 desktop with its integrated GPU enabled can list
+   that one first, where ZLUDA's device 0 would run DLSS. The bridge therefore shows NGX a single CUDA device
+   (cuDeviceGetCount 1, cuDeviceGet(0)), the HIP device:
+     - D4R_HIP_DEVICE, if set;
+     - else the one whose LUID is the D3D12 adapter's (D4R_CUDA_LUID_LOW/HIGH, which the NGX shim sets from the
+       game's device before NGX starts);
+     - else the one with the most compute units.
+   ZLUDA's CUdevice is the HIP ordinal. */
+enum { MAX_HIP_DEVICES = 16 };
+static struct
+{
+    int count; /* listed devices, 0 when HIP cannot be queried */
+    int compute_units[MAX_HIP_DEVICES];
+    unsigned char luid[MAX_HIP_DEVICES][8];
+    char target[MAX_HIP_DEVICES][64]; /* "gfx1201", "" when HIP reports no gfx target */
+    int chosen;                       /* -1: no choice, ZLUDA's own device numbering */
+} hip_devices = {.chosen = -1};
+static pthread_once_t hip_devices_once = PTHREAD_ONCE_INIT;
+
+static unsigned int get_process_u32(const char* name, unsigned int fallback);
+
+static void query_hip_devices(void)
+{
     /* HIP is loaded (preload_hip, or the driver's copy through the DLL search path) before ZLUDA */
     typedef int (*HIP_GET_DEVICE_COUNT_FN)(int*);
     typedef int (*HIP_GET_DEVICE_PROPERTIES_FN)(void*, int);
@@ -493,12 +503,14 @@ static void gpu_architecture(char* out, size_t size)
     HIP_GET_DEVICE_PROPERTIES_FN get_properties =
         hip != NULL ? (HIP_GET_DEVICE_PROPERTIES_FN)(void*)GetProcAddress(hip, "hipGetDevicePropertiesR0600") : NULL;
     int count = 0;
-    if (get_count == NULL || get_properties == NULL || get_count(&count) != 0)
+    if (get_count == NULL || get_properties == NULL || get_count(&count) != 0 || count < 1)
     {
-        tracef("native kernels: cannot query HIP devices (amdhip64 %p); set D4R_GPU_ARCH", (void*)hip);
+        tracef("HIP: cannot list GPUs (amdhip64 %p, %d devices); set D4R_GPU_ARCH for native kernels", (void*)hip, count);
         return;
     }
-    for (int device = 0; device < count && device < 16; ++device)
+    hip_devices.count = count < MAX_HIP_DEVICES ? count : MAX_HIP_DEVICES;
+    int largest = -1;
+    for (int device = 0; device < hip_devices.count; ++device)
     {
         union
         {
@@ -509,23 +521,91 @@ static void gpu_architecture(char* out, size_t size)
         if (get_properties(&properties, device) != 0)
             continue;
         properties.prefix.gcnArchName[sizeof(properties.prefix.gcnArchName) - 1] = '\0';
+        properties.prefix.name[sizeof(properties.prefix.name) - 1] = '\0';
         /* "gfx1201:sramecc-:xnack-" -> "gfx1201" */
-        char target[64];
-        snprintf(target, sizeof(target), "%s", properties.prefix.gcnArchName);
+        char* target = hip_devices.target[device];
+        snprintf(target, sizeof(hip_devices.target[device]), "%s", properties.prefix.gcnArchName);
         target[strcspn(target, ":")] = '\0';
-        const unsigned long simds = properties.prefix.multiProcessorCount > 0 ? (unsigned long)properties.prefix.multiProcessorCount * 2ul : 0;
-        tracef("HIP device %d: %s %s, %d CUs%s", device, properties.prefix.name, target,
-               properties.prefix.multiProcessorCount, properties.prefix.integrated ? ", integrated" : "");
-        if (strncmp(target, "gfx", 3) != 0 || simds == 0)
-            continue;
-        ++gpus;
-        if (simds > best_simds)
-        {
-            best_simds = simds;
-            snprintf(out, size, "%s", target);
-        }
+        if (strncmp(target, "gfx", 3) != 0)
+            target[0] = '\0';
+        hip_devices.compute_units[device] = properties.prefix.multiProcessorCount;
+        memcpy(hip_devices.luid[device], properties.prefix.luid, 8);
+        const unsigned char* luid = hip_devices.luid[device];
+        tracef("HIP device %d: %s %s, %d CUs%s, LUID %02x%02x%02x%02x:%02x%02x%02x%02x", device,
+               properties.prefix.name, target[0] != '\0' ? target : "(no gfx target)",
+               properties.prefix.multiProcessorCount, properties.prefix.integrated ? ", integrated" : "", luid[7],
+               luid[6], luid[5], luid[4], luid[3], luid[2], luid[1], luid[0]);
+        if (target[0] != '\0' && properties.prefix.multiProcessorCount > 0 &&
+            (largest < 0 || properties.prefix.multiProcessorCount > hip_devices.compute_units[largest]))
+            largest = device;
     }
+
+    const char* reason = "the most compute units";
+    int chosen = largest;
+    const char* forced = getenv("D4R_HIP_DEVICE");
+    char* end = NULL;
+    const long index = forced != NULL ? strtol(forced, &end, 10) : -1;
+    const unsigned int low = get_process_u32("D4R_CUDA_LUID_LOW", 0xffffffffu);
+    const unsigned int high = get_process_u32("D4R_CUDA_LUID_HIGH", 0xffffffffu);
+    if (forced != NULL && end != forced && *end == '\0' && index >= 0 && index < hip_devices.count)
+    {
+        chosen = (int)index;
+        reason = "D4R_HIP_DEVICE";
+    }
+    else if (low != 0xffffffffu && high != 0xffffffffu)
+    {
+        unsigned char wanted[8];
+        memcpy(wanted, &low, 4);
+        memcpy(wanted + 4, &high, 4);
+        for (int device = 0; device < hip_devices.count; ++device)
+            if (memcmp(hip_devices.luid[device], wanted, 8) == 0)
+            {
+                chosen = device;
+                reason = "the D3D12 adapter's LUID";
+                break;
+            }
+    }
+    if (chosen < 0)
+    {
+        tracef("HIP: no GPU with a gfx target; CUDA devices are ZLUDA's");
+        return;
+    }
+    hip_devices.chosen = chosen;
+    if (hip_devices.count > 1)
+        tracef("HIP: %d GPUs; DLSS runs on device %d (%s, chosen by %s), the only CUDA device NGX sees; "
+               "D4R_HIP_DEVICE overrides", hip_devices.count, chosen, hip_devices.target[chosen], reason);
+}
+
+/* the HIP ordinal behind the CUDA device NGX sees, -1 to pass ZLUDA's numbering through */
+static int ngx_device(void)
+{
+    pthread_once(&hip_devices_once, query_hip_devices);
+    return hip_devices.chosen;
+}
+#endif
+
+/* The gfx target ("gfx1101") of the GPU DLSS runs on, "" when unknown: D4R_GPU_ARCH if set, else the KFD
+   topology's GPU with the most SIMDs (Windows: the HIP device NGX gets, ngx_device). With an integrated and a
+   discrete GPU (Ryzen 7000/9000 desktops) the first GPU can be the integrated one, whose kernels would not match
+   the discrete GPU. */
+static void gpu_architecture(char* out, size_t size)
+{
+    out[0] = '\0';
+    const char* forced = getenv("D4R_GPU_ARCH");
+    if (forced != NULL && strncmp(forced, "gfx", 3) == 0)
+    {
+        snprintf(out, size, "%s", forced);
+        return;
+    }
+#ifdef D4R_NATIVE_WINDOWS
+    const int device = ngx_device();
+    if (device >= 0)
+        snprintf(out, size, "%s", hip_devices.target[device]);
+    else
+        tracef("native kernels: no HIP GPU found; set D4R_GPU_ARCH");
 #else
+    unsigned long best_simds = 0;
+    int gpus = 0;
     for (int node = 0; node < 16; ++node)
     {
         char path[128];
@@ -550,9 +630,9 @@ static void gpu_architecture(char* out, size_t size)
             snprintf(out, size, "gfx%lu%lu%lx", target / 10000, (target / 100) % 100, target % 100);
         }
     }
-#endif
     if (gpus > 1)
         tracef("native kernels: %d GPUs; using the one with the most SIMDs (%s); D4R_GPU_ARCH overrides", gpus, out);
+#endif
 }
 
 static void prepare_native_kernels(const char* cache_home)
@@ -1007,7 +1087,11 @@ static void create_default_zluda_context(void)
     }
 
     CUdevice device = 0;
+#ifdef D4R_NATIVE_WINDOWS
+    context_setup_result = get_device(&device, ngx_device() >= 0 ? ngx_device() : 0);
+#else
     context_setup_result = get_device(&device, 0);
+#endif
     if (context_setup_result == CUDA_SUCCESS)
         context_setup_result = create_context(&cuda_context, 0, device);
     if (context_setup_result != CUDA_SUCCESS)
@@ -1865,6 +1949,11 @@ CUresult WINAPI cuDeviceGetCount(int* count)
 {
     CUDEVICEGETCOUNT_FN function = (CUDEVICEGETCOUNT_FN)find_zluda_symbol("cuDeviceGetCount");
     CUresult result = function != NULL ? function(count) : CUDA_ERROR_NOT_INITIALIZED;
+#ifdef D4R_NATIVE_WINDOWS
+    /* one device: the GPU DLSS runs on (ngx_device) */
+    if (result == CUDA_SUCCESS && count != NULL && *count > 1 && ngx_device() >= 0)
+        *count = 1;
+#endif
     tracef("cuDeviceGetCount result=%d count=%d", result, count != NULL ? *count : -1);
     return result;
 }
@@ -1872,7 +1961,19 @@ CUresult WINAPI cuDeviceGetCount(int* count)
 CUresult WINAPI cuDeviceGet(CUdevice* device, int ordinal)
 {
     CUDEVICEGET_FN function = (CUDEVICEGET_FN)find_zluda_symbol("cuDeviceGet");
-    CUresult result = function != NULL ? function(device, ordinal) : CUDA_ERROR_NOT_INITIALIZED;
+    int hip_ordinal = ordinal;
+#ifdef D4R_NATIVE_WINDOWS
+    if (function != NULL && ngx_device() >= 0)
+    {
+        if (ordinal != 0)
+        {
+            tracef("cuDeviceGet ordinal=%d: NGX sees one device", ordinal);
+            return CUDA_ERROR_INVALID_DEVICE;
+        }
+        hip_ordinal = ngx_device();
+    }
+#endif
+    CUresult result = function != NULL ? function(device, hip_ordinal) : CUDA_ERROR_NOT_INITIALIZED;
     tracef("cuDeviceGet ordinal=%d result=%d device=%d", ordinal, result, device != NULL ? *device : -1);
     return result;
 }
@@ -2949,5 +3050,176 @@ CUresult WINAPI d4rReleaseVulkanMemory(void* memory)
     HIP_DESTROY_EXTERNAL_MEMORY_FN destroy = (HIP_DESTROY_EXTERNAL_MEMORY_FN)hip_symbol("hipDestroyExternalMemory");
     const int result = destroy != NULL ? destroy(memory) : -1;
     tracef("d4rReleaseVulkanMemory: hipDestroyExternalMemory(%p) -> %d", memory, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+/* d4r: D3D12 interop for native Windows (tools/d3d12_native_interop_probe.cpp, docs/windows.md). AMD's D3D12
+   driver and HIP share VRAM through NT handles from ID3D12Device::CreateSharedHandle, as CUDA does with
+   NVIDIA's. HIP does not take ownership of a handle; the caller closes it.
+
+   d4rImportWin32Memory maps shared memory into the CUDA address space: `type` is a hipExternalMemoryHandleType,
+   5 (D3D12Resource) for a committed resource, whose allocation size `bytes` is, 4 (D3D12Heap) for a heap or
+   2 (OpaqueWin32). d4rReleaseVulkanMemory releases the import. */
+CUresult WINAPI d4rImportWin32Memory(void* handle, uint32_t type, uint64_t bytes, CUdeviceptr* pointer, void** memory)
+{
+    ensure_context();
+    if (handle == NULL || bytes == 0 || pointer == NULL || memory == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    HIP_IMPORT_EXTERNAL_MEMORY_FN import = (HIP_IMPORT_EXTERNAL_MEMORY_FN)hip_symbol("hipImportExternalMemory");
+    HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN map =
+        (HIP_EXTERNAL_MEMORY_GET_MAPPED_BUFFER_FN)hip_symbol("hipExternalMemoryGetMappedBuffer");
+    HIP_DESTROY_EXTERNAL_MEMORY_FN destroy = (HIP_DESTROY_EXTERNAL_MEMORY_FN)hip_symbol("hipDestroyExternalMemory");
+    if (import == NULL || map == NULL || destroy == NULL)
+    {
+        tracef("d4rImportWin32Memory: HIP has no external memory functions");
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    D4rHipExternalMemoryHandleDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.type = (int)type;
+    desc.handle.win32.handle = handle;
+    desc.size = bytes;
+    desc.flags = type == 5 ? 1 : 0; /* hipExternalMemoryDedicated, required for a D3D12 committed resource */
+    void* external = NULL;
+    int result = import(&external, &desc);
+    if (result != 0)
+    {
+        tracef("d4rImportWin32Memory: hipImportExternalMemory(type %u, handle %p, %llu bytes) failed: %d", type,
+               handle, (unsigned long long)bytes, result);
+        return result == 801 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+    }
+    D4rHipExternalMemoryBufferDesc buffer;
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.size = bytes;
+    void* device = NULL;
+    result = map(&device, external, &buffer);
+    if (result != 0)
+    {
+        tracef("d4rImportWin32Memory: hipExternalMemoryGetMappedBuffer failed: %d", result);
+        destroy(external);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *pointer = (CUdeviceptr)(uintptr_t)device;
+    *memory = external;
+    tracef("d4rImportWin32Memory: type %u handle %p -> device %p (%llu bytes)", type, handle, device,
+           (unsigned long long)bytes);
+    return CUDA_SUCCESS;
+}
+
+/* External semaphores: a D3D12 fence shared with HIP (`type` 4, hipExternalSemaphoreHandleTypeD3D12Fence) lets
+   the GPU order D3D12 and DLSS work without the CPU: the game's queue signals the fence when DLSS's inputs are
+   copied, DLSS's stream waits for that value, and signals another one that the game's queue waits for before
+   it reads the output. The waits and signals go on the null stream, where NGX runs. */
+typedef struct
+{
+    int type;
+    union
+    {
+        int fd;
+        struct
+        {
+            void* handle;
+            const void* name;
+        } win32;
+        const void* nvSciSyncObj;
+    } handle;
+    unsigned int flags;
+    unsigned int reserved[16];
+} D4rHipExternalSemaphoreHandleDesc;
+
+typedef struct
+{
+    struct
+    {
+        struct
+        {
+            unsigned long long value;
+        } fence;
+        union
+        {
+            void* fence;
+            unsigned long long reserved;
+        } nvSciSync;
+        struct
+        {
+            unsigned long long key;
+            unsigned int timeoutMs; /* wait parameters only; padding in the signal parameters */
+        } keyedMutex;
+        unsigned int reserved[10];
+    } params;
+    unsigned int flags;
+    unsigned int reserved[16];
+} D4rHipExternalSemaphoreParams;
+
+/* the layouts of HIP's hipExternalSemaphoreHandleDesc and hipExternalSemaphore{Signal,Wait}Params (x86-64) */
+_Static_assert(sizeof(D4rHipExternalSemaphoreHandleDesc) == 96, "hipExternalSemaphoreHandleDesc layout");
+_Static_assert(sizeof(D4rHipExternalSemaphoreParams) == 144, "hipExternalSemaphore*Params layout");
+_Static_assert(offsetof(D4rHipExternalSemaphoreParams, flags) == 72, "hipExternalSemaphore*Params layout");
+
+typedef int (*HIP_IMPORT_EXTERNAL_SEMAPHORE_FN)(void**, const D4rHipExternalSemaphoreHandleDesc*);
+typedef int (*HIP_EXTERNAL_SEMAPHORES_FN)(void* const*, const D4rHipExternalSemaphoreParams*, unsigned int, void*);
+typedef int (*HIP_DESTROY_EXTERNAL_SEMAPHORE_FN)(void*);
+
+CUresult WINAPI d4rImportWin32Semaphore(void* handle, uint32_t type, void** semaphore)
+{
+    ensure_context();
+    if (handle == NULL || semaphore == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    HIP_IMPORT_EXTERNAL_SEMAPHORE_FN import =
+        (HIP_IMPORT_EXTERNAL_SEMAPHORE_FN)hip_symbol("hipImportExternalSemaphore");
+    if (import == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    D4rHipExternalSemaphoreHandleDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.type = (int)type;
+    desc.handle.win32.handle = handle;
+    const int result = import(semaphore, &desc);
+    tracef("d4rImportWin32Semaphore: type %u handle %p -> %p, result %d", type, handle,
+           result == 0 ? *semaphore : NULL, result);
+    return result == 0 ? CUDA_SUCCESS : result == 801 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+}
+
+static CUresult external_semaphore(const char* function_name, void* semaphore, uint64_t value)
+{
+    ensure_context();
+    if (semaphore == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    HIP_EXTERNAL_SEMAPHORES_FN function = (HIP_EXTERNAL_SEMAPHORES_FN)hip_symbol(function_name);
+    if (function == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    D4rHipExternalSemaphoreParams params;
+    memset(&params, 0, sizeof(params));
+    params.params.fence.value = value;
+    void* const semaphores[1] = {semaphore};
+    const int result = function(semaphores, &params, 1, NULL);
+    if (result != 0 || trace_verbose())
+        tracef("%s(%p, %llu) result=%d", function_name, semaphore, (unsigned long long)value, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+/* queues on the null stream a wait until the shared fence reaches `value` */
+CUresult WINAPI d4rWaitSemaphore(void* semaphore, uint64_t value)
+{
+    return external_semaphore("hipWaitExternalSemaphoresAsync", semaphore, value);
+}
+
+/* queues on the null stream a signal of the shared fence to `value` */
+CUresult WINAPI d4rSignalSemaphore(void* semaphore, uint64_t value)
+{
+    return external_semaphore("hipSignalExternalSemaphoresAsync", semaphore, value);
+}
+
+CUresult WINAPI d4rReleaseSemaphore(void* semaphore)
+{
+    HIP_DESTROY_EXTERNAL_SEMAPHORE_FN destroy =
+        (HIP_DESTROY_EXTERNAL_SEMAPHORE_FN)hip_symbol("hipDestroyExternalSemaphore");
+    const int result = destroy != NULL && semaphore != NULL ? destroy(semaphore) : -1;
+    tracef("d4rReleaseSemaphore: hipDestroyExternalSemaphore(%p) -> %d", semaphore, result);
     return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }

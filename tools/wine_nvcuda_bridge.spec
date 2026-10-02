@@ -90,6 +90,11 @@
 @ stdcall cuPointerGetAttribute(ptr ptr ptr) cuPointerGetAttribute
 @ stdcall d4rImportVulkanMemory(ptr int64 int64 ptr ptr) d4rImportVulkanMemory
 @ stdcall d4rReleaseVulkanMemory(ptr) d4rReleaseVulkanMemory
+@ stdcall d4rImportWin32Memory(ptr long int64 ptr ptr) d4rImportWin32Memory
+@ stdcall d4rImportWin32Semaphore(ptr long ptr) d4rImportWin32Semaphore
+@ stdcall d4rWaitSemaphore(ptr int64) d4rWaitSemaphore
+@ stdcall d4rSignalSemaphore(ptr int64) d4rSignalSemaphore
+@ stdcall d4rReleaseSemaphore(ptr) d4rReleaseSemaphore
 @ stdcall d4rMemcpy2DAsync(ptr ptr) d4rMemcpy2DAsync
 @ stdcall d4rCtxSynchronize() d4rCtxSynchronize
 @ stdcall d4rEventSynchronize(ptr) d4rEventSynchronize
