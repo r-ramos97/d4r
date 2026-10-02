@@ -20,6 +20,10 @@
 .PARAMETER Frames
     Frames to evaluate (default 60).
 
+.PARAMETER Rgba8
+    Colour and output in RGBA8 instead of DLSS's own RGBA16F, on a still scene: checks d4r's format conversion on
+    the GPU (as for games whose resources are in other formats).
+
 .PARAMETER SameFrame
     Run as with FrameAge = 0 in d4r.ini: each frame waits on the GPU for its own DLSS result (experimental on
     Windows). The log then says whether the wait worked ("same-frame wait" lines).
@@ -28,7 +32,8 @@ param(
     [ValidateSet("K", "E", "M")][string]$Model = "K",
     [int]$Frames = 60,
     [string]$GameFolder = ".",
-    [switch]$SameFrame
+    [switch]$SameFrame,
+    [switch]$Rgba8
 )
 
 $game = (Resolve-Path -LiteralPath $GameFolder).Path
@@ -62,11 +67,17 @@ if ($SameFrame) {
     $env:D4R_SHIM_SPLIT_FRAME = "1"
     $env:D4R_SHIM_MAX_IN_FLIGHT = "3"
 }
-$env:D4R_HARNESS_MOTION_SCENE = "1"
+if ($Rgba8) {
+    $env:D4R_HARNESS_RGBA8 = "1" # a still scene: the harness's moving scenes are RGBA16F
+    Remove-Item Env:D4R_HARNESS_MOTION_SCENE -ErrorAction SilentlyContinue
+} else {
+    $env:D4R_HARNESS_MOTION_SCENE = "1"
+}
 $output = Join-Path $d4r "test-output.raw"
 Remove-Item -LiteralPath "$output.bmp" -ErrorAction SilentlyContinue
 
-Write-Host ("DLSS model $Model, $Frames frames, 1280x720 -> 2560x1440" + $(if ($SameFrame) { ", same-frame results" } else { "" }))
+Write-Host ("DLSS model $Model, $Frames frames, 1280x720 -> 2560x1440" + $(if ($SameFrame) { ", same-frame results" } else { "" }) +
+            $(if ($Rgba8) { ", RGBA8 colour and output (format conversion)" } else { "" }))
 $watch = [Diagnostics.Stopwatch]::StartNew()
 & $harness (Join-Path $d4r "nvngx.dll") $output $Frames 1280 720 2560 1440
 $code = $LASTEXITCODE
