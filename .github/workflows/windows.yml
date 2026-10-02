@@ -3,23 +3,24 @@
 # package for a game folder. The package holds no NVIDIA files and no OptiScaler.
 name: Windows
 
+# Runs only when ZLUDA or the kernels change (hours, mostly LLVM); windows-package.yml packages its artifacts.
 on:
   push:
     branches: [windows-native]
     paths:
-      - .github/workflows/windows.yml
       - kernels/**
       - patches/zluda/**
       - scripts/build_network_kernels.sh
       - scripts/build_zluda_ptx_helpers.sh
       - scripts/fetch_zluda_source.sh
-      - scripts/package_windows.sh
-      - tools/**
-      - packaging/windows/**
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   ZLUDA_COMMIT: ee2f25a180099fa42f36b2346732e1f2470a03ad

@@ -48,8 +48,8 @@ int main(int argc, char** argv)
 
     unsigned int driver = 0;
     char branch[64] = {0};
-    check(((DriverFn)query(0x2926aaad))(&driver, branch) == 0 && driver == 58142 && strcmp(branch, "r581_00") == 0,
-          "driver 581.42 by default");
+    check(((DriverFn)query(0x2926aaad))(&driver, branch) == 0 && driver == 59636 && strcmp(branch, "r596_00") == 0,
+          "driver 596.36 by default");
 
     LUID luid = {0};
     check(((HandleStructFn)query(0x0ff07fde))(gpus[0], &luid) == 0 && luid.HighPart == 0x1 && luid.LowPart == 0xabcd,

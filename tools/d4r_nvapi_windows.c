@@ -10,7 +10,7 @@
  *
  * Environment (read once):
  *   D4R_NVAPI_GPU_ARCH        AD100 (default), GA100 or TU100: the architecture reported
- *   D4R_NVAPI_DRIVER_VERSION  driver version reported, e.g. 581.42 (default)
+ *   D4R_NVAPI_DRIVER_VERSION  driver version reported (default 596.36, the driver whose NGX core d4r tested)
  *   D4R_NVAPI_LUID            adapter LUID as HIGH:LOW hex (default: the non-software DXGI adapter with the most
  *                             dedicated memory)
  *   D4R_NVAPI_CHAIN           another nvapi64.dll whose interfaces this one does not implement are forwarded to
@@ -107,7 +107,7 @@ static BOOL CALLBACK initialize(PINIT_ONCE once, PVOID parameter, PVOID* context
             state.architecture = 0x160, state.implementation = 0x02, snprintf(state.name, sizeof(state.name),
                                                                                "NVIDIA GeForce RTX 2080 Ti");
     }
-    state.driver_version = 58142;
+    state.driver_version = 59636;
     if (GetEnvironmentVariableA("D4R_NVAPI_DRIVER_VERSION", value, sizeof(value)) > 0)
     {
         unsigned int major = 0, minor = 0;

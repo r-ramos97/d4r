@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
         self.assertIn("PreferAccuracy must be true or false", result.stderr)
 
     def test_shipped_configs_default_off(self):
-        for file in ("config/d4r.ini.default", "packaging/d4r.ini"):
+        for file in ("config/d4r.ini.default", "packaging/d4r.ini", "packaging/windows/d4r.ini"):
             self.assertRegex((ROOT / file).read_text(), r"(?m)^PreferAccuracy\s*=\s*false$")
 
     def test_builder_refuses_to_certify_mixed_fast_binaries(self):

@@ -158,7 +158,7 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         if not (self.binaries / "d4r_nvngx.dll").exists():
             self.skipTest("the shim build needs clang-cl")
         shutil.copy(self.binaries / "d4r_nvngx.dll", self.d4r / "nvngx.dll")
-        shutil.copy(ROOT / "packaging" / "d4r.ini", self.d4r / "d4r.ini")
+        shutil.copy(ROOT / "packaging" / "windows" / "d4r.ini", self.d4r / "d4r.ini")
         (self.d4r / "nvngx_dlss.dll").write_bytes(b"placeholder")
         (self.d4r / "ngx").mkdir(exist_ok=True)
         shutil.copy(self.binaries / "_nvngx.dll", self.d4r / "ngx" / "_nvngx.dll")
