@@ -1,5 +1,10 @@
 # Native Windows
 
+> **Use the official Windows port instead.** This `windows-native` branch is an independent, unvalidated
+> alternative, written before the upstream project gained its own native Windows backend: the
+> [`windows` branch of countervolts/d4r](https://github.com/countervolts/d4r/tree/windows), validated on an
+> RX 9070 XT. This branch is kept for reference only; it has never run on a real AMD GPU.
+
 d4r was written for Linux and Proton. This page describes the native Windows build: how the pieces map onto
 Windows, what differs, how it is built and tested, and what is still open. The user guide that ships in the
 package is [packaging/windows/D4R_WINDOWS_README.txt](../packaging/windows/D4R_WINDOWS_README.txt).

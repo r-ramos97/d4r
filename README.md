@@ -1,5 +1,10 @@
 # d4r (dlss 4 radeon)
 
+> **Use the official Windows port instead.** This `windows-native` branch is an independent, unvalidated
+> alternative, written before the upstream project gained its own native Windows backend: the
+> [`windows` branch of countervolts/d4r](https://github.com/countervolts/d4r/tree/windows), validated on an
+> RX 9070 XT. This branch is kept for reference only; it has never run on a real AMD GPU.
+
 d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest DLSS kernels replaced by hand-written RDNA3 and RDNA4 code.
 
 **Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M). DLSS 5 is PURPOSELY not supported.
