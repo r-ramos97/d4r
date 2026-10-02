@@ -37,13 +37,21 @@ On Windows the bridge:
   `LoadLibrary("nvcuda.dll")` keeps finding the bridge: the test checks this with the real Windows loader;
 - loads HIP and comgr first from `D4R_ROCM_DIR` (d4r.ini `RocmDir`) or the HIP SDK's `HIP_PATH`, so ZLUDA's
   delay-loaded `amdhip64_7.dll` (else `_6`) resolves to that copy;
-- picks the GPU target from HIP's device properties (`hipGetDevicePropertiesR0600`, layout in
-  `tools/d4r_hip_props.h`, offsets checked against ZLUDA's bindings): the device with the most compute units,
-  so a Ryzen iGPU never wins over the discrete GPU. `D4R_GPU_ARCH` overrides it;
+- shows NGX one CUDA device, the GPU DLSS should run on. HIP on Windows lists every AMD GPU, and with a Ryzen
+  7000/9000's integrated GPU enabled that one can come first, where ZLUDA's device 0 would run DLSS. The bridge
+  reads HIP's device properties (`hipGetDevicePropertiesR0600`, layout in `tools/d4r_hip_props.h`, offsets
+  checked against ZLUDA's bindings) and picks `D4R_HIP_DEVICE` if set, else the GPU whose LUID is the game's
+  D3D12 adapter's (the shim names it before NGX starts), else the one with the most compute units;
+  `cuDeviceGetCount` then returns 1 and `cuDeviceGet(0)` that GPU. Its gfx target selects the native kernel set
+  (`D4R_GPU_ARCH` overrides);
 - verifies native kernels exactly as on Linux (`tools/d4r_fatbin.h`): a kernel is served only after NGX loads a
   module whose PTX hash the folder's manifest lists.
 
-`d4rImportVulkanMemory` (winevulkan handles) returns `CUDA_ERROR_NOT_SUPPORTED`; the shim then uses host memory.
+`d4rImportVulkanMemory` (winevulkan handles) returns `CUDA_ERROR_NOT_SUPPORTED`. Instead, the bridge maps
+D3D12 memory through NT handles: `d4rImportWin32Memory` (`hipImportExternalMemory` as a D3D12 resource, a D3D12
+heap or an opaque Win32 handle), and `d4rImportWin32Semaphore`, `d4rWaitSemaphore` and `d4rSignalSemaphore`
+for a shared D3D12 fence (`hipImportExternalSemaphore`, waits and signals on the null stream, where NGX runs).
+The tests check the descriptors HIP receives at the byte offsets of HIP's headers.
 
 ### The shim
 
@@ -56,12 +64,32 @@ NGX gets.
 ### Frames
 
 Under Proton the d4r vkd3d-proton patch splits the game's command list at the DLSS call, so every frame shows
-its own result, and Vulkan interop keeps inputs and output in VRAM. Neither exists with AMD's D3D12 driver. The
-shim's original path runs instead: it copies the inputs to readback buffers on the game's command list, writes a
-frame marker (`WriteBufferImmediate`), runs DLSS when the marker arrives, and copies the newest finished result
-into the output from an upload buffer. Each frame therefore shows a result one frame or more old, and inputs and
-output cross PCIe (about 55 MB per frame at 1440p Quality). The Windows `d4r.ini` sets `FrameAge = 1`, one
+its own result, and Vulkan interop keeps inputs and output in VRAM. AMD's D3D12 driver cannot split a command
+list, so on Windows each frame shows the newest finished result, one frame or more old: the shim copies the
+inputs on the game's command list, writes a frame marker (`WriteBufferImmediate`), runs DLSS when the marker
+arrives, and copies the newest finished result into the output. The Windows `d4r.ini` sets `FrameAge = 1`, one
 frame in flight, the lowest latency on this path.
+
+### VRAM interop
+
+Where the inputs and the result go between the game and DLSS depends on the driver:
+
+- **D3D12 shared buffers** (`VramInterop = true`, the default). The shim creates committed buffers in VRAM
+  with `D3D12_HEAP_FLAG_SHARED`, the bridge maps them into CUDA (`d4rImportWin32Memory`), and the copies are
+  `CopyTextureRegion` calls on the game's command list, into rows aligned to 256 bytes as D3D12's buffer
+  footprints require. It is the same pipeline as the Proton VRAM path, with D3D12 copies instead of Vulkan
+  ones. D3D12 has no blit, so a feature uses it only when the game's resources are in DLSS's own formats:
+  RGBA16F colour and output, 32-bit depth (`D32_FLOAT`, `D32_FLOAT_S8X24` and their typeless forms), RG16F
+  motion vectors, R32F exposure. At startup the shim maps one small buffer; if HIP refuses it, it logs why
+  and stays on host memory.
+- **Host memory** otherwise: readback buffers in, an upload buffer out; about 55 MB per frame cross PCIe at
+  1440p Quality.
+
+`d4r\test-dlss.ps1` first runs `d4r\tools\d4r-interop-probe.exe` (`tools/d3d12_native_interop_probe.cpp`),
+which answers on the user's PC what only the driver can: whether a shared D3D12 buffer maps into HIP (as a
+resource, an opaque handle or a heap), whether data crosses in both directions, whether a shared D3D12 fence
+orders D3D12 and HIP work on the GPU (and whether HIP's stream waits for a value D3D12's `WriteBufferImmediate`
+writes), and what the copies cost against today's readback.
 
 ### NVAPI
 
@@ -114,12 +142,12 @@ those parts through ZLUDA instead, as on Linux without them.
 ## Testing on hardware
 
 1. `d4r\setup.ps1` until it reports everything in place.
-2. `d4r\test-dlss.ps1`: DLSS on synthetic frames through the D3D12 harness, without a game or OptiScaler. It
-   writes `d4r\test-output.raw.bmp`.
+2. `d4r\test-dlss.ps1`: the VRAM sharing check (`d4r\interop-report.txt`), then DLSS on synthetic frames
+   through the D3D12 harness, without a game or OptiScaler. It writes `d4r\test-output.raw.bmp`.
 3. A game from [SUPPORTED_GAMES.md](../SUPPORTED_GAMES.md).
 
 Logs to look at: `d4r\d4r_nvngx.log` (shim and bridge), `d4r_nvapi.log` (NVAPI calls, including unimplemented
-ones), `OptiScaler.log`.
+ones), `d4r\interop-report.txt`, `OptiScaler.log`.
 
 ## Open questions
 
@@ -132,6 +160,7 @@ ones), `OptiScaler.log`.
 - **Same-frame results.** Without vkd3d-proton's split, a D3D12-level equivalent would need the game's queue: a
   hook on `ExecuteCommandLists` cannot split a list the game is still recording into, so this stays a frame late
   unless the game's own frame structure allows otherwise.
-- **VRAM interop.** D3D12 resources shared with HIP (`hipImportExternalMemory` with D3D12 handles) and a
-  GPU-side wait on the frame marker would remove the PCIe copies; whether AMD's Windows HIP supports them needs
-  hardware.
+- **VRAM interop on AMD's driver.** The shared-buffer path and the probe are written against the HIP and D3D12
+  documentation and tested with mocks; the probe's report on real hardware says whether the import works, and
+  a shared fence or the marker wait would let DLSS start on the GPU without the CPU polling the frame marker.
+  Colour or output in other formats (R11G11B10, RGBA8, RGB10A2) would need a compute-shader conversion.

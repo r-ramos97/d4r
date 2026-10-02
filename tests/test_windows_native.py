@@ -78,6 +78,8 @@ def build_binaries(out):
     run(flags + [windows / "nvapi_test.c", "-o", out / "nvapi_test.exe"])
     run(flags + ["-shared", windows / "fake_optiscaler.c", "-lversion", "-o", out / "fake_optiscaler.dll"])
     run(flags + [windows / "preload_test.c", "-o", out / "preload_test.exe"])
+    run(["bash", ROOT / "scripts" / "build_d3d12_native_interop_probe.sh"])
+    shutil.copy(ROOT / "build" / "windows" / "d4r-interop-probe.exe", out / "d4r-interop-probe.exe")
     if CLANG_CL:
         env = dict(os.environ, CLANG_CL=CLANG_CL, MINGW_CXX=os.environ.get("MINGW_CXX", "x86_64-w64-mingw32-g++"))
         run(["bash", ROOT / "scripts" / "build_d4r_nvngx_shim.sh"], env=env)
@@ -103,11 +105,12 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         shutil.copy(cls.binaries / "amdhip64_7.dll", cls.work / "hip" / "bin" / "amdhip64_7.dll")
         cls.exe = cls.binaries / "bridge_test.exe"
 
-        # the release layout: a widened and an FP8 set for the RX 9070 XT, nothing for the iGPU
+        # the release layout: a widened and an FP8 set for the RX 9070 XT, a set for the RX 7900 XTX, nothing for
+        # the iGPU (mock_hip lists all three)
         cls.ptx = cls.work / "module.ptx"
         cls.ptx.write_bytes(PTX.encode())
         hash_ = fnv1a64(PTX.encode())
-        for folder in ("gfx1201", "gfx1201-fp8"):
+        for folder in ("gfx1201", "gfx1201-fp8", "gfx1100"):
             kernels = cls.d4r / "kernels" / folder
             kernels.mkdir(parents=True)
             (kernels / "d4r-kernels.txt").write_text(
@@ -165,6 +168,22 @@ class WindowsNativeBridgeTests(unittest.TestCase):
         shutil.copy(self.binaries / "fake_optiscaler.dll", game / "dxgi.dll")
         self.assert_all_pass(self.run_program(game / "preload_test.exe", windows_path(game),
                                               extra_env={"WINEDLLOVERRIDES": "mscoree,mshtml=;dxgi,version=n,b"}))
+
+    def test_interop_probe_runs_to_its_report(self):
+        """d4r-interop-probe.exe on Windows' software D3D12 renderer against the mock HIP and ZLUDA, whose
+        "device" memory is host memory: nothing is really shared, so it must report that the VRAM path fails,
+        after running every D3D12 step (including a GPU wait nobody satisfies) without hanging or crashing."""
+        result = self.run_program(self.binaries / "d4r-interop-probe.exe", windows_path(self.d4r / "nvcuda.dll"),
+                                  "64", "32", extra_env={"D4R_PROBE_ADAPTER": "warp"})
+        if not ON_WINDOWS and result.returncode == 2:
+            self.skipTest("this Wine has no D3D12 (vkd3d needs Vulkan): " + result.stdout.strip().splitlines()[-1])
+        output = result.stdout
+        self.assertEqual(result.returncode, 1, output + result.stderr[-3000:])
+        self.assertIn("as a D3D12 resource (hipExternalMemoryHandleTypeD3D12Resource): imported", output)
+        self.assertIn("D3D12 texture -> shared buffer -> CUDA: FAIL", output)
+        self.assertIn("D3D12 fence as a HIP external semaphore: imported", output)
+        self.assertIn("round trip D3D12 -> HIP -> D3D12: FAIL (no result within 10 s", output)
+        self.assertIn("RESULT: VRAM sharing FAILS (D3D12 resource), GPU sync: shared fence no, marker no", output)
 
     def test_shim_initialises_ngx_through_the_bridge(self):
         """A portable install on native Windows: OptiScaler loads d4r\\nvngx.dll, which reads d4r.ini and

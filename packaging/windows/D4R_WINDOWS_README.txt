@@ -10,7 +10,9 @@ Status: the Windows build is new and has not run on a real GPU yet. Every part w
 libraries on Windows and Wine; the first runs on real hardware will find what is still missing. Compared
 with the Linux release it has one built-in difference: each frame shows the newest finished DLSS result,
 one frame or more old, because the same-frame mode needs a patched vkd3d-proton that only exists under
-Proton. docs/windows.md in the source repository explains the design and the plan.
+Proton. DLSS's inputs and output stay in video memory when AMD's driver lets HIP share it with D3D12
+(test-dlss.ps1 checks that first); otherwise they are copied through system memory, which costs some
+speed. docs/windows.md in the source repository explains the design and the plan.
 
 
 What you need
@@ -42,7 +44,9 @@ Install
    reports and run it again until it says everything is in place.
 5. Optional, but the best first test: run DLSS without the game, on synthetic frames:
        powershell -ExecutionPolicy Bypass -File d4r\test-dlss.ps1
-   It shows each step and writes d4r\test-output.raw.bmp, the last frame DLSS produced.
+   It first checks whether your driver can share video memory between D3D12 and HIP (report in
+   d4r\interop-report.txt), then shows each step of DLSS and writes d4r\test-output.raw.bmp, the last
+   frame DLSS produced.
 6. Start the game and choose DLSS in its graphics settings.
 
 The first time DLSS starts the game can freeze for a minute or more while DLSS's GPU kernels are
@@ -55,6 +59,10 @@ d4r\d4r.ini holds d4r's settings for the game: the DLSS model (K: DLSS 4, defaul
 DLSS 4.5), FrameAge (1 = least latency, 2-3 = more fps), PreferAccuracy and, on RDNA4, NativeFp8. The
 file explains each one. Restart the game after a change.
 
+PCs with two AMD GPUs (for example a Ryzen 7000/9000 with its integrated graphics enabled and a Radeon
+card): d4r runs DLSS on the GPU the game renders with. To force another one, add D4R_HIP_DEVICE = <number>
+under [Env] in d4r.ini; d4r\d4r_nvngx.log lists the numbers ("HIP device").
+
 
 If something goes wrong
 -----------------------
@@ -63,6 +71,7 @@ Please report what happened with these files from the game folder:
   missing files or libraries; "native kernel" lines say which native kernels were used.
 - d4r_nvapi.log: every NVAPI function the game, OptiScaler and NGX asked for. "unimplemented" lines show
   what may still be needed.
+- d4r\interop-report.txt, written by d4r\test-dlss.ps1.
 - OptiScaler.log (set LogToFile=true in OptiScaler.ini's [Log] section).
 - The output of d4r\setup.ps1 -CheckOnly.
 

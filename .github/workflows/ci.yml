@@ -44,6 +44,10 @@ jobs:
         run: bash scripts/build_wine_nvcuda_bridge.sh
       - name: Native Windows CUDA bridge (build/windows/nvcuda.dll)
         run: bash scripts/build_windows_nvcuda.sh
+      - name: D3D12 interop probe (build/windows/d4r-interop-probe.exe)
+        run: bash scripts/build_d3d12_native_interop_probe.sh
+        env:
+          MINGW_CXX: x86_64-w64-mingw32-g++-posix
       - name: Native Windows tests under Wine
         run: python3 -m unittest tests.test_windows_native -v
         env:

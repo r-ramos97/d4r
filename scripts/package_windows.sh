@@ -22,6 +22,7 @@ STAGE="$OUT/$NAME"
 "$ROOT/scripts/build_d3d12_dlss_harness.sh" >/dev/null  # the shim, and the harness d4r\test-dlss.ps1 runs
 "$ROOT/scripts/build_windows_nvcuda.sh" >/dev/null
 "$ROOT/scripts/build_windows_tools.sh" >/dev/null  # nvapi64.dll, version.dll, d4r-manifest.exe
+"$ROOT/scripts/build_d3d12_native_interop_probe.sh" >/dev/null  # d4r-interop-probe.exe, run by test-dlss.ps1
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/d4r/zluda" "$STAGE/d4r/ngx" "$STAGE/d4r/tools" "$STAGE/d4r/licenses" "$STAGE/d4r/source"
@@ -35,6 +36,7 @@ crlf "$ROOT/packaging/windows/d4r.ini" "$STAGE/d4r/d4r.ini"
 crlf "$ROOT/packaging/windows/setup.ps1" "$STAGE/d4r/setup.ps1"
 crlf "$ROOT/packaging/windows/test-dlss.ps1" "$STAGE/d4r/test-dlss.ps1"
 cp "$ROOT/build/d3d12_dlss_harness.exe" "$STAGE/d4r/tools/d4r-harness.exe"
+cp "$ROOT/build/windows/d4r-interop-probe.exe" "$STAGE/d4r/tools/d4r-interop-probe.exe"
 crlf "$ROOT/packaging/windows/optiscaler.settings" "$STAGE/d4r/optiscaler-d4r.settings"
 cp "$D4R_WIN_ZLUDA/zluda_nvcuda.dll" "$STAGE/d4r/zluda/zluda_nvcuda.dll"
 printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_WINDOWS_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
@@ -55,7 +57,7 @@ for f in "$D4R_WIN_ZLUDA"/*LICENSE*; do [[ -f "$f" ]] && cp "$f" "$L/"; done
   printf 'd4r source: %s\r\n' "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
   printf 'ZLUDA: https://github.com/vosen/ZLUDA at %s with d4r'"'"'s patches/zluda\r\n' \
     "$(cat "$D4R_WIN_ZLUDA/ZLUDA_COMMIT.txt" 2>/dev/null || echo unknown)"
-  printf 'nvapi64.dll, version.dll, d4r\\nvngx.dll, d4r\\nvcuda.dll, d4r\\d4r-manifest.exe, d4r\\tools\\d4r-harness.exe: d4r (tools/)\r\n'
+  printf 'nvapi64.dll, version.dll, d4r\\nvngx.dll, d4r\\nvcuda.dll, d4r\\d4r-manifest.exe, d4r\\tools\\d4r-harness.exe, d4r\\tools\\d4r-interop-probe.exe: d4r (tools/)\r\n'
   printf 'd4r\\kernels: d4r'"'"'s native network kernels (kernels/), built with ROCm\r\n'
 } > "$STAGE/d4r/source/SOURCES.txt"
 

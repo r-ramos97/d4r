@@ -7,10 +7,12 @@
 
         powershell -ExecutionPolicy Bypass -File d4r\test-dlss.ps1
 
-    It drives d4r\nvngx.dll the way OptiScaler does (d4r\tools\d4r-harness.exe, the D3D12 DLSS harness of the d4r
-    repository): a D3D12 device on your GPU, moving synthetic colour, depth and motion vectors at 1280x720, DLSS to
-    2560x1440. It prints each step and the end of d4r's logs, and writes d4r\test-output.raw.bmp, the last DLSS
-    frame. The first run can take minutes while ZLUDA compiles DLSS's kernels.
+    It first checks whether AMD's driver lets HIP share video memory with D3D12 (d4r\tools\d4r-interop-probe.exe,
+    report in d4r\interop-report.txt), which d4r's VRAM path needs. Then it drives d4r\nvngx.dll the way
+    OptiScaler does (d4r\tools\d4r-harness.exe, the D3D12 DLSS harness of the d4r repository): a D3D12 device on
+    your GPU, moving synthetic colour, depth and motion vectors at 1280x720, DLSS to 2560x1440. It prints each step
+    and the end of d4r's logs, and writes d4r\test-output.raw.bmp, the last DLSS frame. The first run can take
+    minutes while ZLUDA compiles DLSS's kernels.
 
 .PARAMETER Model
     DLSS model: K (DLSS 4, default), E (DLSS 3 CNN) or M (DLSS 4.5).
@@ -31,6 +33,24 @@ if (-not (Test-Path -LiteralPath $harness -PathType Leaf)) {
     Write-Host "no d4r\tools\d4r-harness.exe here; run this in the game folder with the d4r package"
     exit 2
 }
+# First, quickly: can AMD's driver share VRAM between D3D12 and HIP? (d4r's VRAM path; the answer goes in
+# d4r\interop-report.txt.) A driver that hangs here is stopped after a minute; DLSS then still runs below.
+$probe = Join-Path $d4r "tools\d4r-interop-probe.exe"
+$report = Join-Path $d4r "interop-report.txt"
+if (Test-Path -LiteralPath $probe -PathType Leaf) {
+    Write-Host "VRAM sharing check (d4r\tools\d4r-interop-probe.exe)..."
+    $process = Start-Process -FilePath $probe -ArgumentList ('"{0}"' -f (Join-Path $d4r "nvcuda.dll")) `
+        -RedirectStandardOutput $report -NoNewWindow -PassThru
+    if (-not $process.WaitForExit(60000)) {
+        $process.Kill()
+        Add-Content -LiteralPath $report "RESULT: the check did not finish within a minute (stopped)"
+    }
+    Get-Content -LiteralPath $report | Where-Object { $_ -match "^(RESULT|The VRAM|VRAM sharing|d4r keeps)" } |
+        ForEach-Object { Write-Host "  $_" }
+    Write-Host "  (details in $report)"
+    Write-Host ""
+}
+
 $env:D4R_DLSS_PRESET = @{ K = "11"; E = "5"; M = "13" }[$Model]
 $env:D4R_HARNESS_MOTION_SCENE = "1"
 $output = Join-Path $d4r "test-output.raw"
@@ -54,5 +74,6 @@ if ($code -eq 0 -and (Test-Path -LiteralPath "$output.bmp")) {
     Write-Host "DLSS ran. Look at $output.bmp: a sharp moving test pattern means it works; black or noise does not."
     exit 0
 }
-Write-Host "DLSS did not complete. Please report this output together with d4r\d4r_nvngx.log and d4r_nvapi.log."
+Write-Host "DLSS did not complete. Please report this output together with d4r\d4r_nvngx.log, d4r_nvapi.log and"
+Write-Host "d4r\interop-report.txt."
 exit 1

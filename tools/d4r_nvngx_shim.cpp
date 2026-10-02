@@ -1515,6 +1515,7 @@ struct VramBuffer
 {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    ID3D12Resource* d3d12 = nullptr; // native Windows: a shared D3D12 buffer instead of the Vulkan one
     CudaDevicePtr device = 0;
     void* external = nullptr;
     size_t bytes = 0;
@@ -2078,6 +2079,12 @@ static uint32_t plane_channels(Plane plane)
 // nvcuda bridge (d4rImportVulkanMemory) maps those buffers into CUDA. The
 // worker then only moves data between them and the CUDA arrays on the GPU.
 // Frames whose formats do not qualify use the readback/upload path.
+//
+// On native Windows (AMD's D3D12 driver, no vkd3d-proton) the buffers are D3D12 committed buffers created
+// shared (CreateSharedHandle), which the native bridge maps into CUDA through HIP (d4rImportWin32Memory), and
+// the copies are D3D12 CopyTextureRegion calls on the game's command list. D3D12 has no blit, so only
+// resources already in the canonical formats qualify; rows are 256-byte aligned, as D3D12's buffer footprints
+// require. Whether the driver supports the import is tried once, with a small buffer.
 
 MIDL_INTERFACE("39da4e09-bd1c-4198-9fae-86bbe3be41fd")
 ID3D12DXVKInteropDevice : public IUnknown
@@ -2157,8 +2164,39 @@ struct VulkanInterop
     PFN_vkSignalSemaphore signalSemaphore = nullptr;
     int(WINAPI* import)(VkDevice, uint64_t, uint64_t, CudaDevicePtr*, void**) = nullptr;
     int(WINAPI* release)(void*) = nullptr;
+    // native Windows: D3D12 shared buffers (see above)
+    bool native = false;
+    int(WINAPI* importWin32)(void*, uint32_t, uint64_t, CudaDevicePtr*, void**) = nullptr;
 };
 static VulkanInterop g_vk;
+
+static bool create_vram_buffer(VramBuffer& target, size_t bytes);
+static void recycle_vram_buffer(VramBuffer& buffer);
+
+// Native Windows, game thread, once: D3D12 shared buffers mapped into CUDA, if the bridge and HIP can.
+static void init_native_vram_interop()
+{
+    load_export(g.cuda, "d4rImportWin32Memory", g_vk.importWin32);
+    load_export(g.cuda, "d4rReleaseVulkanMemory", g_vk.release);
+    if (g_vk.importWin32 == nullptr || g_vk.release == nullptr)
+    {
+        logf("VRAM interop: the nvcuda bridge has no D3D12 import; inputs and the result go through host memory");
+        return;
+    }
+    g_vk.native = true;
+    VramBuffer probe;
+    if (!create_vram_buffer(probe, 65536))
+    {
+        g_vk.native = false;
+        logf("VRAM interop: HIP cannot map a shared D3D12 buffer on this driver (d4r\\nvcuda.dll's log line above "
+             "says why); inputs and the result go through host memory (docs/windows.md)");
+        return;
+    }
+    recycle_vram_buffer(probe); // pooled for the first feature
+    g_vk.ready = true;
+    logf("VRAM interop: ready (native Windows: D3D12 shared buffers mapped into HIP); used when the game's "
+         "resources are in DLSS's own formats");
+}
 
 static bool vram_interop_requested()
 {
@@ -2174,8 +2212,7 @@ static void init_vram_interop()
         if (running_under_wine())
             logf("VRAM interop: ID3D12DXVKInteropDevice1 unavailable (not vkd3d-proton?)");
         else
-            logf("VRAM interop: not available with a native D3D12 driver yet; inputs and the result go through "
-                 "host memory, and each frame shows the newest finished result (docs/windows.md)");
+            init_native_vram_interop();
         return;
     }
     VkInstance instance = VK_NULL_HANDLE;
@@ -2289,11 +2326,63 @@ static bool take_pooled_vram_buffer(VramBuffer& target, size_t bytes)
     return true;
 }
 
+static bool vram_allocated(const VramBuffer& buffer)
+{
+    return buffer.buffer != VK_NULL_HANDLE || buffer.d3d12 != nullptr;
+}
+
+// Native Windows: a committed D3D12 buffer in VRAM, shared, mapped into CUDA by the bridge.
+static bool create_d3d12_vram_buffer(VramBuffer& target, size_t bytes)
+{
+    VramBuffer buffer;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr, __uuidof(ID3D12Resource),
+                                                   reinterpret_cast<void**>(&buffer.d3d12));
+    HANDLE handle = nullptr;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateSharedHandle(buffer.d3d12, nullptr, GENERIC_ALL, nullptr, &handle);
+    int imported = -1;
+    if (SUCCEEDED(hr))
+    {
+        D3D12_RESOURCE_ALLOCATION_INFO info;
+        g.device->GetResourceAllocationInfo(&info, 0, 1, &desc);
+        // HIP does not take ownership of the handle; the resource keeps the memory alive
+        imported = g.worker.call([&] {
+            return g_vk.importWin32(handle, 5 /* hipExternalMemoryHandleTypeD3D12Resource */, info.SizeInBytes,
+                                    &buffer.device, &buffer.external);
+        });
+        CloseHandle(handle);
+    }
+    if (FAILED(hr) || imported != 0)
+    {
+        logf("VRAM interop: shared D3D12 buffer of %zu bytes failed (HRESULT 0x%08lx, import %d)", bytes,
+             static_cast<unsigned long>(hr), imported);
+        if (buffer.d3d12 != nullptr)
+            buffer.d3d12->Release();
+        return false;
+    }
+    buffer.bytes = bytes;
+    target = buffer;
+    return true;
+}
+
 // Game thread. The CUDA import runs on the worker, which owns the context.
 static bool create_vram_buffer(VramBuffer& target, size_t bytes)
 {
     if (take_pooled_vram_buffer(target, bytes))
         return true;
+    if (g_vk.native)
+        return create_d3d12_vram_buffer(target, bytes);
     VramBuffer buffer;
     VkExternalMemoryBufferCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
@@ -2354,13 +2443,15 @@ static void destroy_vram_buffer(VramBuffer& buffer)
         g_vk.free(g_vk.device, buffer.memory, nullptr);
     if (buffer.buffer != VK_NULL_HANDLE)
         g_vk.destroyBuffer(g_vk.device, buffer.buffer, nullptr);
+    if (buffer.d3d12 != nullptr)
+        buffer.d3d12->Release();
     buffer = VramBuffer{};
 }
 
 // Only once no command list or CUDA work uses the buffer: keeps it for a later feature (see g_vramPool).
 static void recycle_vram_buffer(VramBuffer& buffer)
 {
-    if (buffer.buffer == VK_NULL_HANDLE)
+    if (!vram_allocated(buffer))
         return;
     {
         std::lock_guard<std::mutex> lock(g_vramPoolMutex);
@@ -2469,7 +2560,20 @@ struct VramCopy
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     bool convert = false; // blit to/from the plane's canonical format
     UINT width = 0, height = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {}; // native Windows: the texture's layout in a buffer
 };
+
+// Row pitch of a plane or the result in its shared buffer: tight for Vulkan copies, 256-byte aligned for
+// D3D12's buffer footprints.
+static size_t vram_row_bytes(size_t rowBytes)
+{
+    return g_vk.native ? (rowBytes + 255) & ~static_cast<size_t>(255) : rowBytes;
+}
+
+static size_t vram_output_pitch(UINT width)
+{
+    return vram_row_bytes(static_cast<size_t>(width) * 8);
+}
 
 static bool vram_blit_supported(VkFormat source, VkFormat destination)
 {
@@ -2530,6 +2634,26 @@ static bool vram_motion_blit_supported(VkFormat format)
 // to/from the canonical layout of `plane`.
 static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false)
 {
+    if (g_vk.native)
+    {
+        // a raw copy: the texture must already be in the plane's canonical format
+        D3D12_RESOURCE_DESC desc;
+        resource->GetDesc(&desc);
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
+            return false;
+        const bool canonical = output ? desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                                            desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
+                                      : canonical_input(plane, desc.Format);
+        if (!canonical)
+            return false;
+        UINT64 total = 0;
+        g.device->GetCopyableFootprints(&desc, 0, 1, 0, &copy.footprint, nullptr, nullptr, &total);
+        copy.resource = resource;
+        copy.width = static_cast<UINT>(desc.Width);
+        copy.height = desc.Height;
+        copy.convert = false;
+        return true;
+    }
     UINT64 handle = 0, offset = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     if (FAILED(g_vk.interop->GetVulkanResourceInfo1(resource, &handle, &offset, &format)) || handle == 0)
@@ -2570,11 +2694,44 @@ static VkBufferImageCopy full_region(const VramCopy& copy)
     return region;
 }
 
+// Native Windows: where a texture's copy lands in (or comes from) a shared buffer.
+static D3D12_TEXTURE_COPY_LOCATION buffer_location(ID3D12Resource* buffer, const VramCopy& copy, size_t rowBytes)
+{
+    D3D12_TEXTURE_COPY_LOCATION location = {};
+    location.pResource = buffer;
+    location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    location.PlacedFootprint = copy.footprint;
+    location.PlacedFootprint.Offset = 0;
+    location.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(rowBytes);
+    return location;
+}
+
+static D3D12_TEXTURE_COPY_LOCATION texture_location(ID3D12Resource* texture)
+{
+    D3D12_TEXTURE_COPY_LOCATION location = {};
+    location.pResource = texture;
+    location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    location.SubresourceIndex = 0; // a depth-stencil texture's depth plane
+    return location;
+}
+
 // Records the input copies into the slot's buffers. The resources are in
 // COPY_SOURCE state already.
 static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot,
                                const VramCopy* copies, int count, uint32_t frame)
 {
+    if (g_vk.native)
+    {
+        // the shared buffers are in COMMON state, which copies promote implicitly
+        for (int index = 0; index < count; ++index)
+        {
+            const D3D12_TEXTURE_COPY_LOCATION source = texture_location(copies[index].resource);
+            const D3D12_TEXTURE_COPY_LOCATION destination =
+                buffer_location(slot.vram[index].d3d12, copies[index], slot.host[index].rowBytes);
+            list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
+        return true;
+    }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
         return false;
@@ -2640,6 +2797,13 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
 static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer& buffer, const VramCopy& copy,
                                const VramImage& conversion)
 {
+    if (g_vk.native)
+    {
+        const D3D12_TEXTURE_COPY_LOCATION destination = texture_location(copy.resource);
+        const D3D12_TEXTURE_COPY_LOCATION source = buffer_location(buffer.d3d12, copy, vram_output_pitch(copy.width));
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        return true;
+    }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
         return false;
@@ -2789,9 +2953,9 @@ static bool create_split_semaphore(Feature& feature)
 // released since queued command lists may still reference it.
 static bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t bytes)
 {
-    if (buffer.buffer != VK_NULL_HANDLE && buffer.bytes >= bytes)
+    if (vram_allocated(buffer) && buffer.bytes >= bytes)
         return true;
-    if (buffer.buffer != VK_NULL_HANDLE)
+    if (vram_allocated(buffer))
         feature.retiredBuffers.push_back(buffer);
     buffer = VramBuffer{};
     return create_vram_buffer(buffer, bytes);
@@ -3706,15 +3870,16 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     }
     const VramBuffer& buffer = feature->outputs[target].vram;
     const size_t rowBytes = static_cast<size_t>(feature->output.width) * 8;
+    const size_t pitch = vram_output_pitch(feature->output.width); // rowBytes, but 256-aligned for D3D12
     CudaMemcpy2D copy = {};
     copy.srcMemoryType = CUDA_MEMORY_ARRAY;
     copy.srcArray = feature->output.array;
     copy.dstMemoryType = CUDA_MEMORY_DEVICE;
     copy.dstDevice = buffer.device;
-    copy.dstPitch = rowBytes;
+    copy.dstPitch = pitch;
     copy.WidthInBytes = rowBytes;
     copy.Height = feature->output.height;
-    int result = rowBytes * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
+    int result = pitch * feature->output.height > buffer.bytes ? -1 : feature->outputRedirected ? 0 : copy_2d(copy);
     if (result == 0)
     {
         const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -3766,10 +3931,11 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         CudaMemcpy2D readArray = copy;
         readArray.dstMemoryType = CUDA_MEMORY_HOST;
         readArray.dstHost = fromArray.data();
+        readArray.dstPitch = rowBytes;
         CudaMemcpy2D readBuffer = {};
         readBuffer.srcMemoryType = CUDA_MEMORY_DEVICE;
         readBuffer.srcDevice = buffer.device;
-        readBuffer.srcPitch = rowBytes;
+        readBuffer.srcPitch = pitch;
         readBuffer.dstMemoryType = CUDA_MEMORY_HOST;
         readBuffer.dstHost = fromBuffer.data();
         readBuffer.dstPitch = rowBytes;
@@ -3799,6 +3965,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         host.rowBytes = rowBytes;
         copy.dstMemoryType = CUDA_MEMORY_HOST;
         copy.dstHost = host.bytes;
+        copy.dstPitch = rowBytes;
         if (g.cu.memcpy2D(&copy) == 0)
         {
             log_output_hash(host, frame);
@@ -4680,7 +4847,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             HostPlane& geometry = slot.host[index]; // geometry only; the bytes stay in VRAM
             geometry.width = vramInputs[index].width;
             geometry.height = vramInputs[index].height;
-            geometry.rowBytes = canonical_texel_bytes(planes[index]) * geometry.width;
+            geometry.rowBytes = vram_row_bytes(canonical_texel_bytes(planes[index]) * geometry.width);
             if (feature->linearInputs)
                 geometry.rowBytes = (geometry.rowBytes + 255) & ~static_cast<size_t>(255); // texture pitch alignment
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
@@ -4722,8 +4889,8 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         for (OutputSlot& outputSlot : feature->outputs)
         {
             outputSlot.staging.release();
-            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram, static_cast<size_t>(outputDesc.Width) * 8 *
-                                                                            outputDesc.Height)
+            if (p.vram ? !ensure_vram_buffer(*feature, outputSlot.vram,
+                                             vram_output_pitch(static_cast<UINT>(outputDesc.Width)) * outputDesc.Height)
                        : !ensure_staging(outputSlot.staging, output, D3D12_HEAP_TYPE_UPLOAD))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
