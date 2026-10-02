@@ -68,7 +68,10 @@ under [Env] in d4r.ini; d4r\d4r_nvngx.log lists the numbers ("HIP device").
 
 If something goes wrong
 -----------------------
-Please report what happened with these files from the game folder:
+The quickest way to report a problem: run
+       powershell -ExecutionPolicy Bypass -File d4r\collect-logs.ps1
+in the game folder. It puts everything below, and the facts about your PC a report needs (Windows build,
+GPU drivers, HIP SDK, file versions), into d4r-report-<date>.zip. These are the files it collects:
 - d4r\d4r_nvngx.log: d4r's log, rewritten at every launch. Lines with "d4r:" and "nvcuda bridge:" name
   missing files or libraries; "native kernel" lines say which native kernels were used.
 - d4r_nvapi.log: every NVAPI function the game, OptiScaler and NGX asked for. "unimplemented" lines show

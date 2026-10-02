@@ -19,11 +19,16 @@
 
 .PARAMETER Frames
     Frames to evaluate (default 60).
+
+.PARAMETER SameFrame
+    Run as with FrameAge = 0 in d4r.ini: each frame waits on the GPU for its own DLSS result (experimental on
+    Windows). The log then says whether the wait worked ("same-frame wait" lines).
 #>
 param(
     [ValidateSet("K", "E", "M")][string]$Model = "K",
     [int]$Frames = 60,
-    [string]$GameFolder = "."
+    [string]$GameFolder = ".",
+    [switch]$SameFrame
 )
 
 $game = (Resolve-Path -LiteralPath $GameFolder).Path
@@ -52,11 +57,16 @@ if (Test-Path -LiteralPath $probe -PathType Leaf) {
 }
 
 $env:D4R_DLSS_PRESET = @{ K = "11"; E = "5"; M = "13" }[$Model]
+if ($SameFrame) {
+    # what d4r.ini's FrameAge = 0 sets; variables set here take precedence over d4r.ini
+    $env:D4R_SHIM_SPLIT_FRAME = "1"
+    $env:D4R_SHIM_MAX_IN_FLIGHT = "3"
+}
 $env:D4R_HARNESS_MOTION_SCENE = "1"
 $output = Join-Path $d4r "test-output.raw"
 Remove-Item -LiteralPath "$output.bmp" -ErrorAction SilentlyContinue
 
-Write-Host "DLSS model $Model, $Frames frames, 1280x720 -> 2560x1440"
+Write-Host ("DLSS model $Model, $Frames frames, 1280x720 -> 2560x1440" + $(if ($SameFrame) { ", same-frame results" } else { "" }))
 $watch = [Diagnostics.Stopwatch]::StartNew()
 & $harness (Join-Path $d4r "nvngx.dll") $output $Frames 1280 720 2560 1440
 $code = $LASTEXITCODE

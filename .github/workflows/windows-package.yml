@@ -104,3 +104,16 @@ jobs:
           }
           if (-not (Test-Path game\OptiScaler.ini.d4r-backup)) { throw "no OptiScaler.ini backup" }
           if (-not $out.Contains("ok       OptiScaler.ini: set")) { throw "setup did not report the OptiScaler.ini change" }
+      - name: Collect logs
+        shell: powershell
+        run: |
+          Set-Content game\d4r\d4r_nvngx.log "a log line"
+          $out = powershell -ExecutionPolicy Bypass -File game\d4r\collect-logs.ps1 -GameFolder game | Out-String
+          Write-Host $out
+          $zip = Get-ChildItem game\d4r-report-*.zip | Select-Object -First 1
+          if (-not $zip) { throw "no report zip" }
+          Expand-Archive $zip.FullName -DestinationPath report
+          foreach ($name in "d4r_nvngx.log", "d4r.ini", "OptiScaler.ini", "setup-check.txt", "system.txt") {
+            if (-not (Test-Path "report\$name")) { throw "the report lacks $name" }
+          }
+          Get-Content report\system.txt | Write-Host
