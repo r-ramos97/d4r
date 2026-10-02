@@ -38,6 +38,8 @@ int main(int argc, char** argv)
     char nvapi[MAX_PATH] = {0};
     GetModuleFileNameA(GetModuleHandleA("nvapi64.dll"), nvapi, sizeof(nvapi));
     check(_strnicmp(nvapi, argv[1], strlen(argv[1])) == 0, "the NVAPI is the game folder's");
+    check(LoadLibraryExA("nvapi64.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32) == GetModuleHandleA("nvapi64.dll"),
+          "LoadLibraryEx(\"nvapi64.dll\", SEARCH_SYSTEM32) finds the loaded NVAPI");
 
     wchar_t kernel32[MAX_PATH];
     GetSystemDirectoryW(kernel32, MAX_PATH);

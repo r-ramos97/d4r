@@ -152,6 +152,9 @@ int main(int argc, char** argv)
     check(getProc("cuLaunchKernel", &launch, 12080, 0) == 0 && launch == (void*)GetProcAddress(bridge, "cuLaunchKernel"),
           "cuGetProcAddress returns the bridge's own exports", "");
     check(LoadLibraryA("nvcuda.dll") == bridge, "LoadLibrary(\"nvcuda.dll\") finds the bridge, not ZLUDA", "");
+    /* a loader that wants System32's CUDA driver (as NVIDIA's own components may) gets the loaded bridge too */
+    check(LoadLibraryExA("nvcuda.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32) == bridge,
+          "LoadLibraryEx(\"nvcuda.dll\", SEARCH_SYSTEM32) finds the loaded bridge", "");
 
     printf("%d failure(s)\n", failures);
     return failures != 0;
