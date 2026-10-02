@@ -168,6 +168,22 @@ cd zluda && cargo build --release -p zluda               # target/release/nvcuda
 The texture kernels are built from NVIDIA's PTX (`kernels/build.sh tex`) and are not in the package; DLSS runs
 those parts through ZLUDA instead, as on Linux without them.
 
+## Tests without an AMD GPU
+
+`tests/test_windows_native.py` runs under Wine on Linux and, in CI, on a Windows runner, where D3D12 runs on
+WARP (Windows' software renderer):
+
+| Test | What it checks |
+|---|---|
+| bridge | ZLUDA and HIP loading, the GPU and native kernel set chosen (LUID over size, never the iGPU), PTX-hash verification, NGX sync elision, `cuGetProcAddress`, the D3D12 interop exports' HIP descriptors |
+| NVAPI | the identity OptiScaler and NGX read, NGX's own queries, the call log |
+| preload | d4r's `version.dll` loads its NVAPI before a stand-in OptiScaler's `DllMain` |
+| shim | a portable install initialises NGX through the bridge |
+| interop probe | `d4r-interop-probe.exe`'s whole D3D12 sequence on WARP against mocks, ending in a "fails" report without hanging |
+| same-frame shaders | `tools/d4r_d3d12_inline.h` compiled by Windows' FXC and run on WARP |
+| conversion shaders | `tools/d4r_d3d12_convert.h`: every format, against the host path's formulas |
+| harness end to end | the D3D12 harness drives the real shim on WARP (with the D3D12 debug layer when the runner has it) through the bridge to mocks of the NGX core (real parameter objects, a nearest-neighbour "DLSS"), ZLUDA and HIP: host path, VRAM interop, conversions and same-frame results |
+
 ## Testing on hardware
 
 1. `d4r\setup.ps1` until it reports everything in place.

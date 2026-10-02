@@ -74,6 +74,14 @@ jobs:
         with:
           name: windows-tests
           path: windows-tests
+      - name: D3D12 debug layer (Windows' Graphics Tools), which the harness test turns on
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: powershell
+        run: |
+          Add-WindowsCapability -Online -Name "Tools.Graphics.DirectX~~~~0.0.1.0" | Out-String | Write-Host
+          if (Test-Path "$env:WINDIR\System32\d3d12SDKLayers.dll") { Write-Host "d3d12SDKLayers.dll present" }
+          else { Write-Host "::warning::the D3D12 debug layer is unavailable; the harness test runs without it" }
       - name: Bridge and shim against the mock ZLUDA, HIP and NGX core
         run: python -m unittest tests.test_windows_native -v
         env:

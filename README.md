@@ -54,9 +54,12 @@ Native network kernels are built for all listed gfx11/gfx12 targets. Texture ker
 ## Windows (preview)
 
 A native Windows build is in progress on the `windows-native` branch: the same shim, the nvcuda bridge built
-as a Windows DLL, ZLUDA on AMD's HIP SDK and an NVAPI that reports an Ada GPU, without Linux or Proton. It is
-built and tested in CI against mock libraries but has not run on a real GPU yet, and each frame shows a DLSS
-result one frame old. See [docs/windows.md](docs/windows.md).
+as a Windows DLL, ZLUDA on AMD's HIP SDK and an NVAPI that reports an Ada GPU, without Linux or Proton. DLSS's
+inputs and output stay in VRAM through D3D12 buffers shared with HIP (formats other than DLSS's own are
+converted by compute shaders), and `FrameAge = 0` shows each frame's own result through a GPU-side wait in the
+game's command list (experimental; the default shows the newest finished result, one frame old). It is built in
+CI and tested against mock libraries, on a Windows runner's software D3D12 renderer too, but has not run on an
+AMD GPU yet: `d4r\test-dlss.ps1` checks a PC first. See [docs/windows.md](docs/windows.md).
 
 ## How it works
 
