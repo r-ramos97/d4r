@@ -3,7 +3,8 @@
 # package for a game folder. The package holds no NVIDIA files and no OptiScaler.
 name: Windows
 
-# Runs only when ZLUDA or the kernels change (hours, mostly LLVM); windows-package.yml packages its artifacts.
+# Runs only when ZLUDA or the kernels change (hours, mostly LLVM, less once sccache holds it); its last job packages
+# the result with windows-package.yml, which every push packages from the last successful run too.
 on:
   push:
     branches: [windows-native]
@@ -97,3 +98,13 @@ jobs:
           name: zluda-windows
           path: out
           if-no-files-found: error
+
+  package:
+    name: Package
+    needs: zluda
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/windows-package.yml
+    with:
+      same-run: true

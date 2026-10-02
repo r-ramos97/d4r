@@ -1,13 +1,19 @@
 # The d4r package for native Windows (scripts/package_windows.sh) from this commit's d4r DLLs and the ZLUDA and
-# kernel artifacts of the last successful windows.yml run, then d4r\setup.ps1 on a Windows runner.
+# kernel artifacts of the last successful windows.yml run (or, called by windows.yml, of that run), then
+# d4r\setup.ps1 on a Windows runner.
 name: Windows package
 
 on:
   push:
     branches: [windows-native]
-  workflow_run:
-    workflows: [Windows]
-    types: [completed]
+  # windows.yml calls this once ZLUDA is built, with its own artifacts (a workflow_run trigger would fire only
+  # for workflows on the repository's default branch)
+  workflow_call:
+    inputs:
+      same-run:
+        description: package the calling run's ZLUDA and kernel artifacts
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
@@ -17,18 +23,35 @@ permissions:
 jobs:
   package:
     name: Package
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     outputs:
       packaged: ${{ steps.inputs.outputs.found }}
     steps:
       - uses: actions/checkout@v4
+      - name: ZLUDA from this Windows build
+        if: inputs.same-run
+        uses: actions/download-artifact@v4
+        with:
+          name: zluda-windows
+          path: inputs/zluda
+      - name: Kernels from this Windows build
+        if: inputs.same-run
+        uses: actions/download-artifact@v4
+        with:
+          name: network-kernels
+          path: inputs/kernels
       - name: ZLUDA and kernels from the last successful Windows build
         id: inputs
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          BRANCH: ${{ github.ref_name }}
+          SAME_RUN: ${{ inputs.same-run }}
         run: |
+          if [ "$SAME_RUN" = "true" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "ZLUDA and kernels from this run"
+            exit 0
+          fi
           run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows.yml --branch "$BRANCH" --status success \
             --limit 1 --json databaseId --jq '.[0].databaseId // empty')
           if [ -z "$run_id" ]; then
